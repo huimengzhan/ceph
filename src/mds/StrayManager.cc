@@ -27,6 +27,7 @@
 
 #include "StrayManager.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, mds)
@@ -45,6 +46,16 @@ public:
   explicit StrayManagerIOContext(StrayManager *sm_) : sm(sm_) {}
 };
 
+class StrayManagerLogContext : public virtual MDSLogContextBase {
+protected:
+  StrayManager *sm;
+  virtual MDSRank *get_mds()
+  {
+    return sm->mds;
+  }
+public:
+  explicit StrayManagerLogContext(StrayManager *sm_) : sm(sm_) {}
+};
 
 class StrayManagerContext : public virtual MDSInternalContextBase {
 protected:
@@ -108,8 +119,8 @@ void StrayManager::purge(CDentry *dn, uint32_t op_allowance)
       object_t oid = CInode::get_object_name(in->inode.ino, *p, "");
       dout(10) << __func__ << " remove dirfrag " << oid << dendl;
       mds->objecter->remove(oid, oloc, nullsnapc,
-			    ceph::real_clock::now(g_ceph_context),
-			    0, NULL, gather.new_sub());
+			    ceph::real_clock::now(),
+			    0, gather.new_sub());
     }
     assert(gather.has_subs());
     gather.activate();
@@ -139,7 +150,7 @@ void StrayManager::purge(CDentry *dn, uint32_t op_allowance)
       dout(10) << __func__ << " 0~" << to << " objects 0~" << num
 	       << " snapc " << snapc << " on " << *in << dendl;
       filer.purge_range(in->inode.ino, &in->inode.layout, *snapc,
-			0, num, ceph::real_clock::now(g_ceph_context), 0,
+			0, num, ceph::real_clock::now(), 0,
 			gather.new_sub());
     }
   }
@@ -152,8 +163,8 @@ void StrayManager::purge(CDentry *dn, uint32_t op_allowance)
     dout(10) << __func__ << " remove backtrace object " << oid
 	     << " pool " << oloc.pool << " snapc " << snapc << dendl;
     mds->objecter->remove(oid, oloc, *snapc,
-			  ceph::real_clock::now(g_ceph_context), 0,
-			  NULL, gather.new_sub());
+			  ceph::real_clock::now(), 0,
+			  gather.new_sub());
   }
   // remove old backtrace objects
   for (compact_set<int64_t>::iterator p = pi->old_pools.begin();
@@ -163,31 +174,31 @@ void StrayManager::purge(CDentry *dn, uint32_t op_allowance)
     dout(10) << __func__ << " remove backtrace object " << oid
 	     << " old pool " << *p << " snapc " << snapc << dendl;
     mds->objecter->remove(oid, oloc, *snapc,
-			  ceph::real_clock::now(g_ceph_context), 0,
-			  NULL, gather.new_sub());
+			  ceph::real_clock::now(), 0,
+			  gather.new_sub());
   }
   assert(gather.has_subs());
   gather.activate();
 }
 
-class C_PurgeStrayLogged : public StrayManagerContext {
+class C_PurgeStrayLogged : public StrayManagerLogContext {
   CDentry *dn;
   version_t pdv;
   LogSegment *ls;
 public:
   C_PurgeStrayLogged(StrayManager *sm_, CDentry *d, version_t v, LogSegment *s) : 
-    StrayManagerContext(sm_), dn(d), pdv(v), ls(s) { }
+    StrayManagerLogContext(sm_), dn(d), pdv(v), ls(s) { }
   void finish(int r) {
     sm->_purge_stray_logged(dn, pdv, ls);
   }
 };
 
-class C_TruncateStrayLogged : public StrayManagerContext {
+class C_TruncateStrayLogged : public StrayManagerLogContext {
   CDentry *dn;
   LogSegment *ls;
 public:
   C_TruncateStrayLogged(StrayManager *sm, CDentry *d, LogSegment *s) :
-    StrayManagerContext(sm), dn(d), ls(s) { }
+    StrayManagerLogContext(sm), dn(d), ls(s) { }
   void finish(int r) {
     sm->_truncate_stray_logged(dn, ls);
   }
@@ -634,7 +645,12 @@ bool StrayManager::__eval_stray(CDentry *dn, bool delay)
     if (in->is_dir()) {
       if (in->snaprealm && in->snaprealm->has_past_parents()) {
 	dout(20) << "  directory has past parents "
-          << in->snaprealm->srnode.past_parents << dendl;
+		 << in->snaprealm->srnode.past_parents << dendl;
+	if (in->state_test(CInode::STATE_MISSINGOBJS)) {
+	  mds->clog->error() << "previous attempt at committing dirfrag of ino "
+			     << in->ino() << " has failed, missing object\n";
+	  mds->handle_write_error(-ENOENT);
+	}
 	return false;  // not until some snaps are deleted.
       }
 
@@ -755,20 +771,20 @@ void StrayManager::eval_remote_stray(CDentry *stray_dn, CDentry *remote_dn)
     }
   }
   assert(remote_dn->last == CEPH_NOSNAP);
-    // NOTE: we repeat this check in _rename(), since our submission path is racey.
-    if (!remote_dn->is_projected()) {
-      if (remote_dn->is_auth() && remote_dn->dir->can_auth_pin()) {
-        reintegrate_stray(stray_dn, remote_dn);
-      } else if (!remote_dn->is_auth() && stray_dn->is_auth()) {
-        migrate_stray(stray_dn, remote_dn->authority().first);
-      } else {
-        dout(20) << __func__ << ": not reintegrating" << dendl;
-      }
+  // NOTE: we repeat this check in _rename(), since our submission path is racey.
+  if (!remote_dn->is_projected()) {
+    if (remote_dn->is_auth() && remote_dn->dir->can_auth_pin()) {
+      reintegrate_stray(stray_dn, remote_dn);
+    } else if (!remote_dn->is_auth() && stray_dn->is_auth()) {
+      migrate_stray(stray_dn, remote_dn->authority().first);
     } else {
-      // don't do anything if the remote parent is projected, or we may
-      // break user-visible semantics!
-      dout(20) << __func__ << ": not reintegrating (projected)" << dendl;
+      dout(20) << __func__ << ": not reintegrating" << dendl;
     }
+  } else {
+    // don't do anything if the remote parent is projected, or we may
+    // break user-visible semantics!
+    dout(20) << __func__ << ": not reintegrating (projected)" << dendl;
+  }
 }
 
 void StrayManager::reintegrate_stray(CDentry *straydn, CDentry *rdn)
@@ -793,7 +809,7 @@ void StrayManager::reintegrate_stray(CDentry *straydn, CDentry *rdn)
  
 void StrayManager::migrate_stray(CDentry *dn, mds_rank_t to)
 {
-  CInode *in = dn->get_linkage()->get_inode();
+  CInode *in = dn->get_projected_linkage()->get_inode();
   assert(in);
   CInode *diri = dn->dir->get_inode();
   assert(diri->is_stray());
@@ -806,10 +822,11 @@ void StrayManager::migrate_stray(CDentry *dn, mds_rank_t to)
   // rename it to another mds.
   filepath src;
   dn->make_path(src);
+  assert(src.depth() == 2);
 
-  string dname;
-  in->name_stray_dentry(dname);
-  filepath dst(dname, MDS_INO_STRAY(to, 0));
+  filepath dst(MDS_INO_MDSDIR(to));
+  dst.push_dentry(src[0]);
+  dst.push_dentry(src[1]);
 
   MClientRequest *req = new MClientRequest(CEPH_MDS_OP_RENAME);
   req->set_filepath(dst);
@@ -894,13 +911,13 @@ void StrayManager::truncate(CDentry *dn, uint32_t op_allowance)
     // keep backtrace object
     if (num > 1) {
       filer.purge_range(in->ino(), &in->inode.layout, *snapc,
-			1, num - 1, ceph::real_clock::now(g_ceph_context),
+			1, num - 1, ceph::real_clock::now(),
 			0, gather.new_sub());
     }
     filer.zero(in->ino(), &in->inode.layout, *snapc,
 	       0, in->inode.layout.object_size,
-	       ceph::real_clock::now(g_ceph_context),
-	       0, true, NULL, gather.new_sub());
+	       ceph::real_clock::now(),
+	       0, true, gather.new_sub());
   }
 
   assert(gather.has_subs());

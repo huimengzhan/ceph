@@ -74,6 +74,9 @@ struct MonOpRequest : public TrackedOp {
     OP_TYPE_COMMAND,          ///< is a command
   };
 
+  MonOpRequest(const MonOpRequest &other) = delete;
+  MonOpRequest & operator = (const MonOpRequest &other) = delete;
+
 private:
   Message *request;
   utime_t dequeued_time;
@@ -83,7 +86,9 @@ private:
   op_type_t op_type;
 
   MonOpRequest(Message *req, OpTracker *tracker) :
-    TrackedOp(tracker, req->get_recv_stamp()),
+    TrackedOp(tracker,
+      req->get_recv_stamp().is_zero() ?
+      req->get_recv_stamp() : ceph_clock_now()),
     request(req),
     session(NULL),
     con(NULL),
@@ -103,7 +108,7 @@ private:
     }
   }
 
-  void _dump(utime_t now, Formatter *f) const {
+  void _dump(Formatter *f) const {
     {
       f->open_array_section("events");
       Mutex::Locker l(lock);

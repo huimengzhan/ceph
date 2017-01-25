@@ -46,15 +46,17 @@ OpRequest::OpRequest(Message *req, OpTracker *tracker) :
   tracker->mark_event(this, "dispatched", request->get_dispatch_stamp());
 }
 
-void OpRequest::_dump(utime_t now, Formatter *f) const
+void OpRequest::_dump(Formatter *f) const
 {
   Message *m = request;
   f->dump_string("flag_point", state_string());
   if (m->get_orig_source().is_client()) {
     f->open_object_section("client_info");
-    stringstream client_name;
+    stringstream client_name, client_addr;
     client_name << m->get_orig_source();
+    client_addr << m->get_orig_source_addr();
     f->dump_string("client", client_name.str());
+    f->dump_string("client_addr", client_addr.str());
     f->dump_unsigned("tid", m->get_tid());
     f->close_section(); // client_info
   }
@@ -89,21 +91,26 @@ bool OpRequest::check_rmw(int flag) {
   assert(rmw_flags != 0);
   return rmw_flags & flag;
 }
-bool OpRequest::may_read() { return need_read_cap() || need_class_read_cap(); }
-bool OpRequest::may_write() { return need_write_cap() || need_class_write_cap(); }
+bool OpRequest::may_read() {
+  return need_read_cap() || check_rmw(CEPH_OSD_RMW_FLAG_CLASS_READ);
+}
+bool OpRequest::may_write() {
+  return need_write_cap() || check_rmw(CEPH_OSD_RMW_FLAG_CLASS_WRITE);
+}
 bool OpRequest::may_cache() { return check_rmw(CEPH_OSD_RMW_FLAG_CACHE); }
+bool OpRequest::rwordered_forced() {
+  return check_rmw(CEPH_OSD_RMW_FLAG_RWORDERED);
+}
+bool OpRequest::rwordered() {
+  return may_write() || may_cache() || rwordered_forced();
+}
+
 bool OpRequest::includes_pg_op() { return check_rmw(CEPH_OSD_RMW_FLAG_PGOP); }
 bool OpRequest::need_read_cap() {
   return check_rmw(CEPH_OSD_RMW_FLAG_READ);
 }
 bool OpRequest::need_write_cap() {
   return check_rmw(CEPH_OSD_RMW_FLAG_WRITE);
-}
-bool OpRequest::need_class_read_cap() {
-  return check_rmw(CEPH_OSD_RMW_FLAG_CLASS_READ);
-}
-bool OpRequest::need_class_write_cap() {
-  return check_rmw(CEPH_OSD_RMW_FLAG_CLASS_WRITE);
 }
 bool OpRequest::need_promote() {
   return check_rmw(CEPH_OSD_RMW_FLAG_FORCE_PROMOTE);
@@ -134,6 +141,7 @@ void OpRequest::set_cache() { set_rmw_flags(CEPH_OSD_RMW_FLAG_CACHE); }
 void OpRequest::set_promote() { set_rmw_flags(CEPH_OSD_RMW_FLAG_FORCE_PROMOTE); }
 void OpRequest::set_skip_handle_cache() { set_rmw_flags(CEPH_OSD_RMW_FLAG_SKIP_HANDLE_CACHE); }
 void OpRequest::set_skip_promote() { set_rmw_flags(CEPH_OSD_RMW_FLAG_SKIP_PROMOTE); }
+void OpRequest::set_force_rwordered() { set_rmw_flags(CEPH_OSD_RMW_FLAG_RWORDERED); }
 
 void OpRequest::mark_flag_point(uint8_t flag, const string& s) {
 #ifdef WITH_LTTNG
@@ -146,4 +154,11 @@ void OpRequest::mark_flag_point(uint8_t flag, const string& s) {
   tracepoint(oprequest, mark_flag_point, reqid.name._type,
 	     reqid.name._num, reqid.tid, reqid.inc, rmw_flags,
 	     flag, s.c_str(), old_flags, hit_flag_points);
+}
+
+ostream& operator<<(ostream& out, const OpRequest::ClassInfo& i)
+{
+  out << "class " << i.name << " rd " << i.read
+    << " wr " << i.write << " wl " << i.whitelisted;
+  return out;
 }

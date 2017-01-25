@@ -21,6 +21,7 @@
 #include "RecoveryQueue.h"
 
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mds->get_nodeid() << " RecoveryQueue::" << __func__ << " "
@@ -176,7 +177,7 @@ void RecoveryQueue::_recovered(CInode *in, int r, uint64_t size, utime_t mtime)
     mds->mdcache->remove_inode(in);
   } else {
     // journal
-    mds->locker->check_inode_max_size(in, true, true, size, false, 0, mtime);
+    mds->locker->check_inode_max_size(in, true, 0,  size, mtime);
     mds->locker->eval(in, CEPH_LOCK_IFILE);
     in->auth_unpin(this);
   }

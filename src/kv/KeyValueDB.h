@@ -11,6 +11,7 @@
 #include "include/memory.h"
 #include <boost/scoped_ptr.hpp>
 #include "include/encoding.h"
+#include "common/Formatter.h"
 
 using std::string;
 /**
@@ -55,7 +56,13 @@ public:
       const std::string &k,	      ///< [in] Key to set
       const bufferlist &bl    ///< [in] Value to set
       ) = 0;
-
+    virtual void set(
+      const std::string &prefix,
+      const char *k,
+      size_t keylen,
+      const bufferlist& bl) {
+      set(prefix, string(k, keylen), bl);
+    }
 
     /// Removes Keys (via encoded bufferlist)
     void rmkeys(
@@ -87,6 +94,13 @@ public:
       const std::string &prefix,   ///< [in] Prefix to search for
       const std::string &k	      ///< [in] Key to remove
       ) = 0;
+    virtual void rmkey(
+      const std::string &prefix,   ///< [in] Prefix to search for
+      const char *k,	      ///< [in] Key to remove
+      size_t keylen
+      ) {
+      rmkey(prefix, string(k, keylen));
+    }
 
     /// Remove Single Key which exists and was not overwritten.
     /// This API is only related to performance optimization, and should only be 
@@ -124,6 +138,7 @@ public:
   virtual int init(string option_str="") = 0;
   virtual int open(std::ostream &out) = 0;
   virtual int create_and_open(std::ostream &out) = 0;
+  virtual void close() { }
 
   virtual Transaction get_transaction() = 0;
   virtual int submit_transaction(Transaction) = 0;
@@ -151,6 +166,11 @@ public:
       r = -ENOENT;
     }
     return r;
+  }
+  virtual int get(const string &prefix,
+		  const char *key, size_t keylen,
+		  bufferlist *value) {
+    return get(prefix, string(key, keylen), value);
   }
 
   class GenericIteratorImpl {
@@ -267,14 +287,6 @@ public:
     return std::make_shared<IteratorImpl>(prefix, get_iterator());
   }
 
-  WholeSpaceIterator get_snapshot_iterator() {
-    return _get_snapshot_iterator();
-  }
-
-  Iterator get_snapshot_iterator(const std::string &prefix) {
-    return std::make_shared<IteratorImpl>(prefix, get_snapshot_iterator());
-  }
-
   virtual uint64_t get_estimated_size(std::map<std::string,uint64_t> &extra) = 0;
   virtual int get_statfs(struct store_statfs_t *buf) {
     return -EOPNOTSUPP;
@@ -299,7 +311,7 @@ public:
   class MergeOperator {
     public:
     /// Merge into a key that doesn't exist
-    virtual void merge_nonexistant(
+    virtual void merge_nonexistent(
       const char *rdata, size_t rlen,
       std::string *new_value) = 0;
     /// Merge into a key that does exist
@@ -319,13 +331,15 @@ public:
     return -EOPNOTSUPP;
   }
 
+  virtual void get_statistics(Formatter *f) {
+    return;
+  }
 protected:
   /// List of matching prefixes and merge operators
   std::vector<std::pair<std::string,
 			std::shared_ptr<MergeOperator> > > merge_ops;
 
   virtual WholeSpaceIterator _get_iterator() = 0;
-  virtual WholeSpaceIterator _get_snapshot_iterator() = 0;
 };
 
 #endif

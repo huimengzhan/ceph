@@ -27,8 +27,6 @@ class ReplicatedBackend : public PGBackend {
   };
   friend struct C_ReplicatedBackend_OnPullComplete;
 public:
-  CephContext *cct;
-
   ReplicatedBackend(
     PGBackend::Listener *pg,
     coll_t coll,
@@ -58,7 +56,7 @@ public:
     RecoveryHandle *h
     );
 
-  void check_recovery_sources(const OSDMapRef osdmap);
+  void check_recovery_sources(const OSDMapRef& osdmap);
 
   /// @see PGBackend::delay_message_until_active
   bool can_handle_while_inactive(OpRequestRef op);
@@ -169,6 +167,7 @@ private:
     ObjectRecoveryInfo recovery_info;
     ObjectContextRef obc;
     object_stat_sum_t stat;
+    ObcLockManager lock_manager;
 
     void dump(Formatter *f) const {
       {
@@ -187,12 +186,15 @@ private:
 
   // pull
   struct PullInfo {
+    pg_shard_t from;
+    hobject_t soid;
     ObjectRecoveryProgress recovery_progress;
     ObjectRecoveryInfo recovery_info;
     ObjectContextRef head_ctx;
     ObjectContextRef obc;
     object_stat_sum_t stat;
     bool cache_dont_need;
+    ObcLockManager lock_manager;
 
     void dump(Formatter *f) const {
       {
@@ -216,6 +218,9 @@ private:
 
   // Reverse mapping from osd peer to objects beging pulled from that peer
   map<pg_shard_t, set<hobject_t, hobject_t::BitwiseComparator> > pull_from_peer;
+  void clear_pull(
+    map<hobject_t, PullInfo, hobject_t::BitwiseComparator>::iterator piter,
+    bool clear_pull_from_peer = true);
 
   void sub_op_push(OpRequestRef op);
   void sub_op_push_reply(OpRequestRef op);
@@ -235,9 +240,15 @@ private:
 
   bool handle_push_reply(pg_shard_t peer, PushReplyOp &op, PushOp *reply);
   void handle_pull(pg_shard_t peer, PullOp &op, PushOp *reply);
+
+  struct pull_complete_info {
+    hobject_t hoid;
+    ObjectContextRef obc;
+    object_stat_sum_t stat;
+  };
   bool handle_pull_response(
     pg_shard_t from, PushOp &op, PullOp *response,
-    list<hobject_t> *to_continue,
+    list<pull_complete_info> *to_continue,
     ObjectStore::Transaction *t);
   void handle_push(pg_shard_t from, PushOp &op, PushReplyOp *response,
 		   ObjectStore::Transaction *t);
@@ -283,7 +294,8 @@ private:
     SnapSet& snapset, const hobject_t& poid, const pg_missing_t& missing,
     const hobject_t &last_backfill,
     interval_set<uint64_t>& data_subset,
-    map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets);
+    map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+    ObcLockManager &lock_manager);
   void prepare_pull(
     eversion_t v,
     const hobject_t& soid,
@@ -296,26 +308,31 @@ private:
   void prep_push_to_replica(
     ObjectContextRef obc, const hobject_t& soid, pg_shard_t peer,
     PushOp *pop, bool cache_dont_need = true);
-  void prep_push(ObjectContextRef obc,
-		 const hobject_t& oid, pg_shard_t dest,
-		 PushOp *op,
-		 bool cache_dont_need);
-  void prep_push(ObjectContextRef obc,
-		 const hobject_t& soid, pg_shard_t peer,
-		 eversion_t version,
-		 interval_set<uint64_t> &data_subset,
-		 map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
-		 PushOp *op,
-                 bool cache = false);
-  void calc_head_subsets(ObjectContextRef obc, SnapSet& snapset, const hobject_t& head,
-			 const pg_missing_t& missing,
-			 const hobject_t &last_backfill,
-			 interval_set<uint64_t>& data_subset,
-			 map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets);
+  void prep_push(
+    ObjectContextRef obc,
+    const hobject_t& oid, pg_shard_t dest,
+    PushOp *op,
+    bool cache_dont_need);
+  void prep_push(
+    ObjectContextRef obc,
+    const hobject_t& soid, pg_shard_t peer,
+    eversion_t version,
+    interval_set<uint64_t> &data_subset,
+    map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+    PushOp *op,
+    bool cache,
+    ObcLockManager &&lock_manager);
+  void calc_head_subsets(
+    ObjectContextRef obc, SnapSet& snapset, const hobject_t& head,
+    const pg_missing_t& missing,
+    const hobject_t &last_backfill,
+    interval_set<uint64_t>& data_subset,
+    map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+    ObcLockManager &lock_manager);
   ObjectRecoveryInfo recalc_subsets(
     const ObjectRecoveryInfo& recovery_info,
-    SnapSetContext *ssc
-    );
+    SnapSetContext *ssc,
+    ObcLockManager &lock_manager);
 
   /**
    * Client IO
@@ -340,15 +357,22 @@ private:
   };
   map<ceph_tid_t, InProgressOp> in_progress_ops;
 public:
-  PGTransaction *get_transaction();
   friend class C_OSD_OnOpCommit;
   friend class C_OSD_OnOpApplied;
+
+  void call_write_ordered(std::function<void(void)> &&cb) override {
+    // ReplicatedBackend submits writes inline in submit_transaction, so
+    // we can just call the callback.
+    cb();
+  }
+
   void submit_transaction(
     const hobject_t &hoid,
+    const object_stat_sum_t &delta_stats,
     const eversion_t &at_version,
     PGTransactionUPtr &&t,
     const eversion_t &trim_to,
-    const eversion_t &trim_rollback_to,
+    const eversion_t &roll_forward_to,
     const vector<pg_log_entry_t> &log_entries,
     boost::optional<pg_hit_set_history_t> &hset_history,
     Context *on_local_applied_sync,
@@ -366,12 +390,11 @@ private:
     ceph_tid_t tid,
     osd_reqid_t reqid,
     eversion_t pg_trim_to,
-    eversion_t pg_trim_rollback_to,
+    eversion_t pg_roll_forward_to,
     hobject_t new_temp_oid,
     hobject_t discard_temp_oid,
     const vector<pg_log_entry_t> &log_entries,
     boost::optional<pg_hit_set_history_t> &hset_history,
-    InProgressOp *op,
     ObjectStore::Transaction &op_t,
     pg_shard_t peer,
     const pg_info_t &pinfo);
@@ -381,7 +404,7 @@ private:
     ceph_tid_t tid,
     osd_reqid_t reqid,
     eversion_t pg_trim_to,
-    eversion_t pg_trim_rollback_to,
+    eversion_t pg_roll_forward_to,
     hobject_t new_temp_oid,
     hobject_t discard_temp_oid,
     const vector<pg_log_entry_t> &log_entries,
@@ -407,24 +430,9 @@ private:
   };
   typedef ceph::shared_ptr<RepModify> RepModifyRef;
 
-  struct C_OSD_RepModifyApply : public Context {
-    ReplicatedBackend *pg;
-    RepModifyRef rm;
-    C_OSD_RepModifyApply(ReplicatedBackend *pg, RepModifyRef r)
-      : pg(pg), rm(r) {}
-    void finish(int r) {
-      pg->sub_op_modify_applied(rm);
-    }
-  };
-  struct C_OSD_RepModifyCommit : public Context {
-    ReplicatedBackend *pg;
-    RepModifyRef rm;
-    C_OSD_RepModifyCommit(ReplicatedBackend *pg, RepModifyRef r)
-      : pg(pg), rm(r) {}
-    void finish(int r) {
-      pg->sub_op_modify_commit(rm);
-    }
-  };
+  struct C_OSD_RepModifyApply;
+  struct C_OSD_RepModifyCommit;
+
   void sub_op_modify_applied(RepModifyRef rm);
   void sub_op_modify_commit(RepModifyRef rm);
   bool scrub_supported() { return true; }

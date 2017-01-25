@@ -59,6 +59,7 @@ private:
 
   friend class MDSContinuation;
   friend class ServerContext;
+  friend class ServerLogContext;
 
 public:
   bool terminating_sessions;
@@ -112,8 +113,8 @@ public:
   void handle_client_request(MClientRequest *m);
 
   void journal_and_reply(MDRequestRef& mdr, CInode *tracei, CDentry *tracedn,
-			 LogEvent *le, MDSInternalContextBase *fin);
-  void submit_mdlog_entry(LogEvent *le, MDSInternalContextBase *fin,
+			 LogEvent *le, MDSLogContextBase *fin);
+  void submit_mdlog_entry(LogEvent *le, MDSLogContextBase *fin,
                           MDRequestRef& mdr, const char *evt);
   void dispatch_client_request(MDRequestRef& mdr);
   void early_reply(MDRequestRef& mdr, CInode *tracei, CDentry *tracedn);
@@ -134,6 +135,7 @@ public:
   void handle_slave_auth_pin_ack(MDRequestRef& mdr, MMDSSlaveRequest *ack);
 
   // some helpers
+  bool check_fragment_space(MDRequestRef& mdr, CDir *in);
   bool check_access(MDRequestRef& mdr, CInode *in, unsigned mask);
   bool _check_access(Session *session, CInode *in, unsigned mask, int caller_uid, int caller_gid, int setattr_uid, int setattr_gid);
   CDir *validate_dentry_dir(MDRequestRef& mdr, CInode *diri, const string& dname);
@@ -143,7 +145,7 @@ public:
   CInode* prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino, unsigned mode,
 			    file_layout_t *layout=NULL);
   void journal_allocated_inos(MDRequestRef& mdr, EMetaBlob *blob);
-  void apply_allocated_inos(MDRequestRef& mdr);
+  void apply_allocated_inos(MDRequestRef& mdr, Session *session);
 
   CInode* rdlock_path_pin_ref(MDRequestRef& mdr, int n, set<SimpleLock*>& rdlocks, bool want_auth,
 			      bool no_want_auth=false,
@@ -175,12 +177,17 @@ public:
   int parse_layout_vxattr(string name, string value, const OSDMap& osdmap,
 			  file_layout_t *layout, bool validate=true);
   int parse_quota_vxattr(string name, string value, quota_info_t *quota);
+  int check_layout_vxattr(MDRequestRef& mdr,
+                          string name,
+                          string value,
+                          file_layout_t *layout);
   void handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
 			 file_layout_t *dir_layout,
 			 set<SimpleLock*> rdlocks,
 			 set<SimpleLock*> wrlocks,
 			 set<SimpleLock*> xlocks);
   void handle_remove_vxattr(MDRequestRef& mdr, CInode *cur,
+			    file_layout_t *dir_layout,
 			    set<SimpleLock*> rdlocks,
 			    set<SimpleLock*> wrlocks,
 			    set<SimpleLock*> xlocks);
@@ -226,7 +233,7 @@ public:
   void _unlink_local_finish(MDRequestRef& mdr,
 			    CDentry *dn, CDentry *straydn,
 			    version_t);
-  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, CDentry *dn, CDentry *straydn);
+  bool _rmdir_prepare_witness(MDRequestRef& mdr, mds_rank_t who, vector<CDentry*>& trace, CDentry *straydn);
   void handle_slave_rmdir_prep(MDRequestRef& mdr);
   void _logged_slave_rmdir(MDRequestRef& mdr, CDentry *srcdn, CDentry *straydn);
   void _commit_slave_rmdir(MDRequestRef& mdr, int r);
@@ -250,7 +257,7 @@ public:
 
   // helpers
   bool _rename_prepare_witness(MDRequestRef& mdr, mds_rank_t who, set<mds_rank_t> &witnesse,
-			       CDentry *srcdn, CDentry *destdn, CDentry *straydn);
+			       vector<CDentry*>& srctrace, vector<CDentry*>& dsttrace, CDentry *straydn);
   version_t _rename_prepare_import(MDRequestRef& mdr, CDentry *srcdn, bufferlist *client_map_bl);
   bool _need_force_journal(CInode *diri, bool empty);
   void _rename_prepare(MDRequestRef& mdr,

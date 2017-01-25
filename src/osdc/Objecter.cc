@@ -34,7 +34,6 @@
 #include "messages/MStatfs.h"
 #include "messages/MStatfsReply.h"
 
-#include "messages/MOSDFailure.h"
 #include "messages/MMonCommand.h"
 
 #include "messages/MCommand.h"
@@ -49,6 +48,7 @@
 #include "common/scrub_types.h"
 #include "include/str_list.h"
 #include "common/errno.h"
+#include "common/EventTrace.h"
 
 using ceph::real_time;
 using ceph::real_clock;
@@ -71,8 +71,7 @@ enum {
   l_osdc_op_send,
   l_osdc_op_send_bytes,
   l_osdc_op_resend,
-  l_osdc_op_ack,
-  l_osdc_op_commit,
+  l_osdc_op_reply,
 
   l_osdc_op,
   l_osdc_op_r,
@@ -85,6 +84,7 @@ enum {
   l_osdc_osdop_read,
   l_osdc_osdop_write,
   l_osdc_osdop_writefull,
+  l_osdc_osdop_writesame,
   l_osdc_osdop_append,
   l_osdc_osdop_zero,
   l_osdc_osdop_truncate,
@@ -151,6 +151,14 @@ enum {
 static const char *config_keys[] = {
   "crush_location",
   NULL
+};
+
+class Objecter::RequestStateHook : public AdminSocketHook {
+  Objecter *m_objecter;
+public:
+  explicit RequestStateHook(Objecter *objecter);
+  bool call(std::string command, cmdmap_t& cmdmap, std::string format,
+            bufferlist& out);
 };
 
 /**
@@ -239,8 +247,7 @@ void Objecter::init()
     pcb.add_u64_counter(l_osdc_op_send, "op_send", "Sent operations");
     pcb.add_u64_counter(l_osdc_op_send_bytes, "op_send_bytes", "Sent data");
     pcb.add_u64_counter(l_osdc_op_resend, "op_resend", "Resent operations");
-    pcb.add_u64_counter(l_osdc_op_ack, "op_ack", "Commit callbacks");
-    pcb.add_u64_counter(l_osdc_op_commit, "op_commit", "Operation commits");
+    pcb.add_u64_counter(l_osdc_op_reply, "op_reply", "Operation reply");
 
     pcb.add_u64_counter(l_osdc_op, "op", "Operations");
     pcb.add_u64_counter(l_osdc_op_r, "op_r",
@@ -258,6 +265,8 @@ void Objecter::init()
     pcb.add_u64_counter(l_osdc_osdop_write, "osdop_write", "Write operations");
     pcb.add_u64_counter(l_osdc_osdop_writefull, "osdop_writefull",
 			"Write full object operations");
+    pcb.add_u64_counter(l_osdc_osdop_writesame, "osdop_writesame",
+                        "Write same operations");
     pcb.add_u64_counter(l_osdc_osdop_append, "osdop_append",
 			"Append operation");
     pcb.add_u64_counter(l_osdc_osdop_zero, "osdop_zero",
@@ -383,12 +392,14 @@ void Objecter::init()
 /*
  * ok, cluster interaction can happen
  */
-void Objecter::start()
+void Objecter::start(const OSDMap* o)
 {
   shared_lock rl(rwlock);
 
   start_tick();
-  if (osdmap->get_epoch() == 0) {
+  if (o) {
+    osdmap->deepish_copy_from(*o);
+  } else if (osdmap->get_epoch() == 0) {
     _maybe_request_map();
   }
 }
@@ -543,9 +554,7 @@ void Objecter::_send_linger(LingerOp *info,
   watchl.unlock();
   Op *o = new Op(info->target.base_oid, info->target.base_oloc,
 		 opv, info->target.flags | CEPH_OSD_FLAG_READ,
-		 NULL, NULL,
-		 info->pobjver);
-  o->oncommit_sync = oncommit;
+		 oncommit, info->pobjver);
   o->outbl = poutbl;
   o->snapid = info->snap;
   o->snapc = info->snapc;
@@ -679,8 +688,7 @@ void Objecter::_send_linger_ping(LingerOp *info)
   C_Linger_Ping *onack = new C_Linger_Ping(this, info);
   Op *o = new Op(info->target.base_oid, info->target.base_oloc,
 		 opv, info->target.flags | CEPH_OSD_FLAG_READ,
-		 NULL, NULL, NULL);
-  o->oncommit_sync = onack;
+		 onack, NULL, NULL);
   o->target = info->target;
   o->should_resend = false;
   _send_op_account(o);
@@ -848,7 +856,7 @@ void Objecter::_linger_submit(LingerOp *info, shunique_lock& sul)
 
   // Populate Op::target
   OSDSession *s = NULL;
-  _calc_target(&info->target, &info->last_force_resend);
+  _calc_target(&info->target);
 
   // Create LingerOp<->OSDSession relation
   int r = _get_session(info->target.osd, &s, sul);
@@ -1056,7 +1064,7 @@ void Objecter::_scan_requests(OSDSession *s,
     if (pool_full_map)
       force_resend_writes = force_resend_writes ||
 	(*pool_full_map)[op->target.base_oloc.pool];
-    int r = _calc_target(&op->target, &op->last_force_resend);
+    int r = _calc_target(&op->target);
     switch (r) {
     case RECALC_OP_TARGET_NO_ACTION:
       if (!force_resend &&
@@ -1284,7 +1292,7 @@ void Objecter::handle_osd_map(MOSDMap *m)
        p != need_resend_linger.end(); ++p) {
     LingerOp *op = *p;
     if (!op->session) {
-      _calc_target(&op->target, &op->last_force_resend);
+      _calc_target(&op->target);
       OSDSession *s = NULL;
       int const r = _get_session(op->target.osd, &s, sul);
       assert(r == 0);
@@ -1445,14 +1453,8 @@ void Objecter::_check_op_pool_dne(Op *op, unique_lock& sl)
       ldout(cct, 10) << "check_op_pool_dne tid " << op->tid
 		     << " concluding pool " << op->target.base_pgid.pool()
 		     << " dne" << dendl;
-      if (op->onack) {
-	op->onack->complete(-ENOENT);
-      }
-      if (op->oncommit) {
-	op->oncommit->complete(-ENOENT);
-      }
-      if (op->oncommit_sync) {
-	op->oncommit_sync->complete(-ENOENT);
+      if (op->onfinish) {
+	op->onfinish->complete(-ENOENT);
       }
 
       OSDSession *s = op->session;
@@ -1826,7 +1828,7 @@ struct C_Objecter_GetVersion : public Context {
       objecter->wait_for_latest_osdmap(fin);
     } else {
       // it doesn't return any other error codes!
-      assert(0);
+      ceph_abort();
     }
   }
 };
@@ -2199,15 +2201,10 @@ void Objecter::_send_op_account(Op *op)
   inflight_ops.inc();
 
   // add to gather set(s)
-  if (op->onack) {
-    num_unacked.inc();
+  if (op->onfinish) {
+    num_in_flight.inc();
   } else {
-    ldout(cct, 20) << " note: not requesting ack" << dendl;
-  }
-  if (op->oncommit || op->oncommit_sync) {
-    num_uncommitted.inc();
-  } else {
-    ldout(cct, 20) << " note: not requesting commit" << dendl;
+    ldout(cct, 20) << " note: not requesting reply" << dendl;
   }
 
   logger->inc(l_osdc_op_active);
@@ -2232,13 +2229,13 @@ void Objecter::_send_op_account(Op *op)
     case CEPH_OSD_OP_READ: code = l_osdc_osdop_read; break;
     case CEPH_OSD_OP_WRITE: code = l_osdc_osdop_write; break;
     case CEPH_OSD_OP_WRITEFULL: code = l_osdc_osdop_writefull; break;
+    case CEPH_OSD_OP_WRITESAME: code = l_osdc_osdop_writesame; break;
     case CEPH_OSD_OP_APPEND: code = l_osdc_osdop_append; break;
     case CEPH_OSD_OP_ZERO: code = l_osdc_osdop_zero; break;
     case CEPH_OSD_OP_TRUNCATE: code = l_osdc_osdop_truncate; break;
     case CEPH_OSD_OP_DELETE: code = l_osdc_osdop_delete; break;
     case CEPH_OSD_OP_MAPEXT: code = l_osdc_osdop_mapext; break;
     case CEPH_OSD_OP_SPARSE_READ: code = l_osdc_osdop_sparse_read; break;
-    case CEPH_OSD_OP_CLONERANGE: code = l_osdc_osdop_clonerange; break;
     case CEPH_OSD_OP_GETXATTR: code = l_osdc_osdop_getxattr; break;
     case CEPH_OSD_OP_SETXATTR: code = l_osdc_osdop_setxattr; break;
     case CEPH_OSD_OP_CMPXATTR: code = l_osdc_osdop_cmpxattr; break;
@@ -2266,7 +2263,6 @@ void Objecter::_send_op_account(Op *op)
     case CEPH_OSD_OP_CALL: code = l_osdc_osdop_call; break;
     case CEPH_OSD_OP_WATCH: code = l_osdc_osdop_watch; break;
     case CEPH_OSD_OP_NOTIFY: code = l_osdc_osdop_notify; break;
-    case CEPH_OSD_OP_SRC_CMPXATTR: code = l_osdc_osdop_src_cmpxattr; break;
     }
     if (code)
       logger->inc(code);
@@ -2283,26 +2279,38 @@ void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
   assert(op->session == NULL);
   OSDSession *s = NULL;
 
-  bool const check_for_latest_map = _calc_target(&op->target,
-						 &op->last_force_resend)
+  bool check_for_latest_map = _calc_target(&op->target)
     == RECALC_OP_TARGET_POOL_DNE;
 
   // Try to get a session, including a retry if we need to take write lock
   int r = _get_session(op->target.osd, &s, sul);
+  if (r == -EAGAIN ||
+      (check_for_latest_map && sul.owns_lock_shared())) {
+    epoch_t orig_epoch = osdmap->get_epoch();
+    sul.unlock();
+    if (cct->_conf->objecter_debug_inject_relock_delay) {
+      sleep(1);
+    }
+    sul.lock();
+    if (orig_epoch != osdmap->get_epoch()) {
+      // map changed; recalculate mapping
+      ldout(cct, 10) << __func__ << " relock raced with osdmap, recalc target"
+		     << dendl;
+      check_for_latest_map = _calc_target(&op->target)
+	== RECALC_OP_TARGET_POOL_DNE;
+      if (s) {
+	put_session(s);
+	s = NULL;
+	r = -EAGAIN;
+      }
+    }
+  }
   if (r == -EAGAIN) {
     assert(s == NULL);
-    sul.unlock();
-    sul.lock();
     r = _get_session(op->target.osd, &s, sul);
   }
   assert(r == 0);
   assert(s);  // may be homeless
-
-  // We may need to take wlock if we will need to _set_op_map_check later.
-  if (check_for_latest_map && sul.owns_lock_shared()) {
-    sul.unlock();
-    sul.lock();
-  }
 
   _send_op_account(op);
 
@@ -2373,8 +2381,7 @@ void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
   sl.unlock();
   put_session(s);
 
-  ldout(cct, 5) << num_unacked.read() << " unacked, " << num_uncommitted.read()
-		<< " uncommitted" << dendl;
+  ldout(cct, 5) << num_in_flight.read() << " in flight" << dendl;
 }
 
 int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r)
@@ -2399,20 +2406,10 @@ int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r)
   ldout(cct, 10) << __func__ << " tid " << tid << " in session " << s->osd
 		 << dendl;
   Op *op = p->second;
-  if (op->onack) {
-    op->onack->complete(r);
-    op->onack = NULL;
-    num_unacked.dec();
-  }
-  if (op->oncommit || op->oncommit_sync)
-    num_uncommitted.dec();
-  if (op->oncommit) {
-    op->oncommit->complete(r);
-    op->oncommit = NULL;
-  }
-  if (op->oncommit_sync) {
-    op->oncommit_sync->complete(r);
-    op->oncommit_sync = NULL;
+  if (op->onfinish) {
+    num_in_flight.dec();
+    op->onfinish->complete(r);
+    op->onfinish = NULL;
   }
   _op_cancel_map_check(op);
   _finish_op(op, r);
@@ -2645,8 +2642,7 @@ int64_t Objecter::get_object_pg_hash_position(int64_t pool, const string& key,
   return p->raw_hash_to_pg(p->hash_key(key, ns));
 }
 
-int Objecter::_calc_target(op_target_t *t, epoch_t *last_force_resend,
-			   bool any_change)
+int Objecter::_calc_target(op_target_t *t, bool any_change)
 {
   // rwlock is locked
 
@@ -2662,11 +2658,12 @@ int Objecter::_calc_target(op_target_t *t, epoch_t *last_force_resend,
   bool force_resend = false;
   bool need_check_tiering = false;
   if (osdmap->get_epoch() == pi->last_force_op_resend) {
-    if (last_force_resend && *last_force_resend < pi->last_force_op_resend) {
-      *last_force_resend = pi->last_force_op_resend;
+    if (t->last_force_resend < pi->last_force_op_resend) {
+      t->last_force_resend = pi->last_force_op_resend;
       force_resend = true;
-    } else if (last_force_resend == 0)
+    } else if (t->last_force_resend == 0) {
       force_resend = true;
+    }
   }
   if (t->target_oid.name.empty() || force_resend) {
     t->target_oid = t->base_oid;
@@ -2929,7 +2926,7 @@ int Objecter::_recalc_linger_op_target(LingerOp *linger_op,
 {
   // rwlock is locked unique
 
-  int r = _calc_target(&linger_op->target, &linger_op->last_force_resend,
+  int r = _calc_target(&linger_op->target,
 		       true);
   if (r == RECALC_OP_TARGET_NEED_RESEND) {
     ldout(cct, 10) << "recalc_linger_op_target tid " << linger_op->linger_id
@@ -2961,14 +2958,9 @@ void Objecter::_cancel_linger_op(Op *op)
   ldout(cct, 15) << "cancel_op " << op->tid << dendl;
 
   assert(!op->should_resend);
-  if (op->onack) {
-    delete op->onack;
-    num_unacked.dec();
-  }
-  if (op->oncommit || op->oncommit_sync) {
-    delete op->oncommit;
-    delete op->oncommit_sync;
-    num_uncommitted.dec();
+  if (op->onfinish) {
+    delete op->onfinish;
+    num_in_flight.dec();
   }
 
   _finish_op(op, 0);
@@ -3019,10 +3011,8 @@ MOSDOp *Objecter::_prepare_osd_op(Op *op)
 
   int flags = op->target.flags;
   flags |= CEPH_OSD_FLAG_KNOWN_REDIR;
-  if (op->oncommit || op->oncommit_sync)
+  if (op->onfinish)
     flags |= CEPH_OSD_FLAG_ONDISK;
-  if (op->onack)
-    flags |= CEPH_OSD_FLAG_ACK;
 
   if (!honor_osdmap_full)
     flags |= CEPH_OSD_FLAG_FULL_FORCE;
@@ -3211,6 +3201,21 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 		<< dendl;
   Op *op = iter->second;
 
+  if (retry_writes_after_first_reply && op->attempts == 1 &&
+      (op->target.flags & CEPH_OSD_FLAG_WRITE)) {
+    ldout(cct, 7) << "retrying write after first reply: " << tid << dendl;
+    if (op->onfinish) {
+      num_in_flight.dec();
+    }
+    _session_op_remove(s, op);
+    sl.unlock();
+    put_session(s);
+
+    _op_submit(op, sul, NULL);
+    m->put();
+    return;
+  }
+
   if (m->get_retry_attempt() >= 0) {
     if (m->get_retry_attempt() != (op->attempts - 1)) {
       ldout(cct, 7) << " ignoring reply from attempt "
@@ -3229,17 +3234,14 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     // have, but that is better than doing callbacks out of order.
   }
 
-  Context *onack = 0;
-  Context *oncommit = 0;
+  Context *onfinish = 0;
 
   int rc = m->get_result();
 
   if (m->is_redirect_reply()) {
     ldout(cct, 5) << " got redirect reply; redirecting" << dendl;
-    if (op->onack)
-      num_unacked.dec();
-    if (op->oncommit || op->oncommit_sync)
-      num_uncommitted.dec();
+    if (op->onfinish)
+      num_in_flight.dec();
     _session_op_remove(s, op);
     sl.unlock();
     put_session(s);
@@ -3319,43 +3321,23 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     }
   }
 
-  // ack|commit -> ack
-  if (op->onack) {
-    ldout(cct, 15) << "handle_osd_op_reply ack" << dendl;
-    op->replay_version = m->get_replay_version();
-    onack = op->onack;
-    op->onack = 0;  // only do callback once
-    num_unacked.dec();
-    logger->inc(l_osdc_op_ack);
+  // NOTE: we assume that since we only request ONDISK ever we will
+  // only ever get back one (type of) ack ever.
+
+  if (op->onfinish) {
+    num_in_flight.dec();
+    onfinish = op->onfinish;
+    op->onfinish = NULL;
   }
-  if (m->is_ondisk() || rc) {
-    if (op->oncommit) {
-      ldout(cct, 15) << "handle_osd_op_reply safe" << dendl;
-      oncommit = op->oncommit;
-      op->oncommit = NULL;
-      num_uncommitted.dec();
-      logger->inc(l_osdc_op_commit);
-    }
-    if (op->oncommit_sync) {
-      ldout(cct, 15) << "handle_osd_op_reply safe (sync)" << dendl;
-      op->oncommit_sync->complete(rc);
-      op->oncommit_sync = NULL;
-      num_uncommitted.dec();
-      logger->inc(l_osdc_op_commit);
-    }
-  }
+  logger->inc(l_osdc_op_reply);
 
   /* get it before we call _finish_op() */
   auto completion_lock = s->get_lock(op->target.base_oid);
 
-  // done with this tid?
-  if (!op->onack && !op->oncommit && !op->oncommit_sync) {
-    ldout(cct, 15) << "handle_osd_op_reply completed tid " << tid << dendl;
-    _finish_op(op, 0);
-  }
+  ldout(cct, 15) << "handle_osd_op_reply completed tid " << tid << dendl;
+  _finish_op(op, 0);
 
-  ldout(cct, 5) << num_unacked.read() << " unacked, " << num_uncommitted.read()
-		<< " uncommitted" << dendl;
+  ldout(cct, 5) << num_in_flight.read() << " in flight" << dendl;
 
   // serialize completions
   if (completion_lock.mutex()) {
@@ -3364,11 +3346,8 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
   sl.unlock();
 
   // do callbacks
-  if (onack) {
-    onack->complete(rc);
-  }
-  if (oncommit) {
-    oncommit->complete(rc);
+  if (onfinish) {
+    onfinish->complete(rc);
   }
   if (completion_lock.mutex()) {
     completion_lock.unlock();
@@ -3457,7 +3436,7 @@ void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
     list_context->current_pg_epoch = 0;
     list_context->starting_pg_num = pg_num;
   }
-  assert(list_context->current_pg <= pg_num);
+  assert(list_context->current_pg < pg_num);
 
   ObjectOperation op;
   op.pg_nls(list_context->max_entries, list_context->filter,
@@ -3613,7 +3592,7 @@ void Objecter::list_objects(ListContext *list_context, Context *onfinish)
     list_context->current_pg_epoch = 0;
     list_context->starting_pg_num = pg_num;
   }
-  assert(list_context->current_pg <= pg_num);
+  assert(list_context->current_pg < pg_num);
 
   ObjectOperation op;
   op.pg_ls(list_context->max_entries, list_context->filter,
@@ -3808,7 +3787,7 @@ int Objecter::create_pool(string& name, Context *onfinish, uint64_t auid,
   unique_lock wl(rwlock);
   ldout(cct, 10) << "create_pool name=" << name << dendl;
 
-  if (osdmap->lookup_pg_pool_name(name.c_str()) >= 0)
+  if (osdmap->lookup_pg_pool_name(name) >= 0)
     return -EEXIST;
 
   PoolOp *op = new PoolOp;
@@ -3927,6 +3906,7 @@ void Objecter::_pool_op_submit(PoolOp *op)
  */
 void Objecter::handle_pool_op_reply(MPoolOpReply *m)
 {
+  FUNCTRACE();
   shunique_lock sul(rwlock, acquire_shared);
   if (!initialized.read()) {
     sul.unlock();
@@ -4312,6 +4292,18 @@ void Objecter::ms_handle_remote_reset(Connection *con)
   ms_handle_reset(con);
 }
 
+bool Objecter::ms_handle_refused(Connection *con)
+{
+  // just log for now
+  if (osdmap && (con->get_peer_type() == CEPH_ENTITY_TYPE_OSD)) {
+    int osd = osdmap->identify_osd(con->get_peer_addr());
+    if (osd >= 0) {
+      ldout(cct, 1) << "ms_handle_refused on osd." << osd << dendl;
+    }
+  }
+  return false;
+}
+
 bool Objecter::ms_get_authorizer(int dest_type,
 				 AuthAuthorizer **authorizer,
 				 bool force_new)
@@ -4323,7 +4315,6 @@ bool Objecter::ms_get_authorizer(int dest_type,
   *authorizer = monc->auth->build_authorizer(dest_type);
   return *authorizer != NULL;
 }
-
 
 void Objecter::op_target_t::dump(Formatter *f) const
 {
@@ -4696,19 +4687,22 @@ int Objecter::_calc_command_target(CommandOp *c, shunique_lock& sul)
       c->map_check_error_str = "osd down";
       return RECALC_OP_TARGET_OSD_DOWN;
     }
-    c->osd = c->target_osd;
+    c->target.osd = c->target_osd;
   } else {
-    if (!osdmap->have_pg_pool(c->target_pg.pool())) {
+    int ret = _calc_target(&(c->target), true);
+    if (ret == RECALC_OP_TARGET_POOL_DNE) {
       c->map_check_error = -ENOENT;
       c->map_check_error_str = "pool dne";
-      return RECALC_OP_TARGET_POOL_DNE;
+      return ret;
+    } else if (ret == RECALC_OP_TARGET_OSD_DOWN) {
+      c->map_check_error = -ENXIO;
+      c->map_check_error_str = "osd down";
+      return ret;
     }
-    vector<int> acting;
-    osdmap->pg_to_acting_osds(c->target_pg, &acting, &c->osd);
   }
 
   OSDSession *s;
-  int r = _get_session(c->osd, &s, sul);
+  int r = _get_session(c->target.osd, &s, sul);
   assert(r != -EAGAIN); /* shouldn't happen as we're holding the write lock */
 
   if (c->session != s) {
@@ -4730,7 +4724,7 @@ void Objecter::_assign_command_session(CommandOp *c,
   assert(sul.owns_lock() && sul.mutex() == &rwlock);
 
   OSDSession *s;
-  int r = _get_session(c->osd, &s, sul);
+  int r = _get_session(c->target.osd, &s, sul);
   assert(r != -EAGAIN); /* shouldn't happen as we're holding the write lock */
 
   if (c->session != s) {
@@ -4849,7 +4843,7 @@ void Objecter::set_epoch_barrier(epoch_t epoch)
   ldout(cct, 7) << __func__ << ": barrier " << epoch << " (was "
 		<< epoch_barrier << ") current epoch " << osdmap->get_epoch()
 		<< dendl;
-  if (epoch >= epoch_barrier) {
+  if (epoch > epoch_barrier) {
     epoch_barrier = epoch;
     _maybe_request_map();
   }
@@ -5077,8 +5071,15 @@ namespace {
 			       int *rval)
       : interval(interval), snapsets(snapsets), rval(rval) {}
     void finish(int r) override {
-      if (r < 0 && r != -EAGAIN)
+      if (r < 0 && r != -EAGAIN) {
+        if (rval)
+          *rval = r;
 	return;
+      }
+
+      if (rval)
+        *rval = 0;
+
       try {
 	decode();
       } catch (buffer::error&) {

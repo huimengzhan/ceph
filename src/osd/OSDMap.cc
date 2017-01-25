@@ -1007,6 +1007,15 @@ int OSDMap::identify_osd(const uuid_d& u) const
   return -1;
 }
 
+int OSDMap::identify_osd_on_all_channels(const entity_addr_t& addr) const
+{
+  for (int i=0; i<max_osd; i++)
+    if (exists(i) && (get_addr(i) == addr || get_cluster_addr(i) == addr ||
+	get_hb_back_addr(i) == addr || get_hb_front_addr(i) == addr))
+      return i;
+  return -1;
+}
+
 int OSDMap::find_osd_on_ip(const entity_addr_t& ip) const
 {
   for (int i=0; i<max_osd; i++)
@@ -1151,8 +1160,8 @@ void OSDMap::dedup(const OSDMap *o, OSDMap *n)
 
   // does crush match?
   bufferlist oc, nc;
-  ::encode(*o->crush, oc);
-  ::encode(*n->crush, nc);
+  ::encode(*o->crush, oc, CEPH_FEATURES_SUPPORTED_DEFAULT);
+  ::encode(*n->crush, nc, CEPH_FEATURES_SUPPORTED_DEFAULT);
   if (oc.contents_equal(nc)) {
     n->crush = o->crush;
   }
@@ -1289,9 +1298,13 @@ int OSDMap::apply_incremental(const Incremental &inc)
   for (map<int64_t,string>::const_iterator p = inc.new_pool_names.begin();
        p != inc.new_pool_names.end();
        ++p) {
-    if (pool_name.count(p->first))
-      name_pool.erase(pool_name[p->first]);
-    pool_name[p->first] = p->second;
+    auto pool_name_entry = pool_name.find(p->first);
+    if (pool_name_entry != pool_name.end()) {
+      name_pool.erase(pool_name_entry->second);
+      pool_name_entry->second = p->second;
+    } else {
+      pool_name[p->first] = p->second;
+    }
     name_pool[p->second] = p->first;
   }
   for (set<int64_t>::const_iterator p = inc.old_pools.begin();
@@ -1424,10 +1437,8 @@ int OSDMap::apply_incremental(const Incremental &inc)
   }
 
   // blacklist
-  for (map<entity_addr_t,utime_t>::const_iterator p = inc.new_blacklist.begin();
-       p != inc.new_blacklist.end();
-       ++p) {
-    blacklist[p->first] = p->second;
+  if (!inc.new_blacklist.empty()) {
+    blacklist.insert(inc.new_blacklist.begin(),inc.new_blacklist.end());
     new_blacklist_entries = true;
   }
   for (vector<entity_addr_t>::const_iterator p = inc.old_blacklist.begin();
@@ -1709,20 +1720,24 @@ void OSDMap::_pg_to_up_acting_osds(const pg_t& pg, vector<int> *up, int *up_prim
   int _up_primary;
   int _acting_primary;
   ps_t pps;
-  _pg_to_raw_osds(*pool, pg, &raw, &_up_primary, &pps);
-  _raw_to_up_osds(*pool, raw, &_up, &_up_primary);
-  _apply_primary_affinity(pps, *pool, &_up, &_up_primary);
   _get_temp_osds(*pool, pg, &_acting, &_acting_primary);
-  if (_acting.empty()) {
-    _acting = _up;
-    if (_acting_primary == -1) {
-      _acting_primary = _up_primary;
+  if (_acting.empty() || up || up_primary) {
+    _pg_to_raw_osds(*pool, pg, &raw, &_up_primary, &pps);
+    _raw_to_up_osds(*pool, raw, &_up, &_up_primary);
+    _apply_primary_affinity(pps, *pool, &_up, &_up_primary);
+    if (_acting.empty()) {
+      _acting = _up;
+      if (_acting_primary == -1) {
+        _acting_primary = _up_primary;
+      }
     }
+  
+    if (up)
+      up->swap(_up);
+    if (up_primary)
+      *up_primary = _up_primary;
   }
-  if (up)
-    up->swap(_up);
-  if (up_primary)
-    *up_primary = _up_primary;
+
   if (acting)
     acting->swap(_acting);
   if (acting_primary)
@@ -1741,8 +1756,6 @@ int OSDMap::calc_pg_rank(int osd, const vector<int>& acting, int nrep)
 
 int OSDMap::calc_pg_role(int osd, const vector<int>& acting, int nrep)
 {
-  if (!nrep)
-    nrep = acting.size();
   return calc_pg_rank(osd, acting, nrep);
 }
 
@@ -1821,7 +1834,7 @@ void OSDMap::encode_client_old(bufferlist& bl) const
 
   // crush
   bufferlist cbl;
-  crush->encode(cbl);
+  crush->encode(cbl, 0 /* legacy (no) features */);
   ::encode(cbl, bl);
 }
 
@@ -1856,7 +1869,7 @@ void OSDMap::encode_classic(bufferlist& bl, uint64_t features) const
 
   // crush
   bufferlist cbl;
-  crush->encode(cbl);
+  crush->encode(cbl, 0 /* legacy (no) features */);
   ::encode(cbl, bl);
 
   // extended
@@ -1924,7 +1937,7 @@ void OSDMap::encode(bufferlist& bl, uint64_t features) const
 
     // crush
     bufferlist cbl;
-    crush->encode(cbl);
+    crush->encode(cbl, features);
     ::encode(cbl, bl);
     ::encode(erasure_code_profiles, bl);
     ENCODE_FINISH(bl); // client-usable data
@@ -2380,6 +2393,10 @@ string OSDMap::get_flag_string(unsigned f)
     s += ",notieragent";
   if (f & CEPH_OSDMAP_SORTBITWISE)
     s += ",sortbitwise";
+  if (f & CEPH_OSDMAP_REQUIRE_JEWEL)
+    s += ",require_jewel_osds";
+  if (f & CEPH_OSDMAP_REQUIRE_KRAKEN)
+    s += ",require_kraken_osds";
   if (s.length())
     s.erase(0, 1);
   return s;
@@ -2630,7 +2647,7 @@ int OSDMap::build_simple(CephContext *cct, epoch_t e, uuid_d &fsid,
 		 << dendl;
   epoch = e;
   set_fsid(fsid);
-  created = modified = ceph_clock_now(cct);
+  created = modified = ceph_clock_now();
 
   if (nosd >=  0) {
     set_max_osd(nosd);
@@ -2973,8 +2990,11 @@ int OSDMap::summarize_mapping_stats(
       f->dump_unsigned("moved_pgs", moved_pg);
       f->dump_unsigned("total_pgs", total_pg);
     } else {
+      float percent = 0;
+      if (total_pg)
+        percent = (float)moved_pg * 100.0 / (float)total_pg;
       ss << "moved " << moved_pg << " / " << total_pg
-	 << " (" << ((float)moved_pg * 100.0 / (float)total_pg) << "%)\n";
+	 << " (" << percent << "%)\n";
     }
   }
   if (f) {

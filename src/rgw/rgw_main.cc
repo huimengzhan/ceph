@@ -53,6 +53,9 @@
 #include "rgw_request.h"
 #include "rgw_process.h"
 #include "rgw_frontend.h"
+#if defined(WITH_RADOSGW_ASIO_FRONTEND)
+#include "rgw_asio_frontend.h"
+#endif /* WITH_RADOSGW_ASIO_FRONTEND */
 
 #include <map>
 #include <string>
@@ -78,9 +81,8 @@ void signal_shutdown()
     int val = 0;
     int ret = write(signal_fd[0], (char *)&val, sizeof(val));
     if (ret < 0) {
-      int err = -errno;
       derr << "ERROR: " << __func__ << ": write() returned "
-	   << cpp_strerror(-err) << dendl;
+           << cpp_strerror(errno) << dendl;
     }
   }
 }
@@ -94,7 +96,7 @@ static void wait_shutdown()
   }
 }
 
-int signal_fd_init()
+static int signal_fd_init()
 {
   return socketpair(AF_UNIX, SOCK_STREAM, 0, signal_fd);
 }
@@ -108,7 +110,9 @@ static void signal_fd_finalize()
 static void handle_sigterm(int signum)
 {
   dout(1) << __func__ << dendl;
+#if defined(WITH_RADOSGW_FCGI_FRONTEND)
   FCGX_ShutdownPending();
+#endif
 
   // send a signal to make fcgi's accept(2) wake up.  unfortunately the
   // initial signal often isn't sufficient because we race with accept's
@@ -151,7 +155,7 @@ public:
   }
 };
 
-int usage()
+static int usage()
 {
   cerr << "usage: radosgw [options...]" << std::endl;
   cerr << "options:\n";
@@ -173,9 +177,6 @@ static RGWRESTMgr *set_logging(RGWRESTMgr *mgr)
   return mgr;
 }
 
-void intrusive_ptr_add_ref(CephContext* cct) { cct->get(); }
-void intrusive_ptr_release(CephContext* cct) { cct->put(); }
-
 RGWRealmReloader *preloader = NULL;
 
 static void reloader_handler(int signum)
@@ -188,11 +189,14 @@ static void reloader_handler(int signum)
   sighup_handler(signum);
 }
 
-
 /*
  * start up the RADOS connection and then handle HTTP messages as they come in
  */
+#ifdef BUILDING_FOR_EMBEDDED
+extern "C" int cephd_rgw(int argc, const char **argv)
+#else
 int main(int argc, const char **argv)
+#endif
 {
   // dout() messages will be sent to stderr, but FCGX wants messages on stdout
   // Redirect stderr to stdout.
@@ -200,7 +204,7 @@ int main(int argc, const char **argv)
   if (TEMP_FAILURE_RETRY(dup2(STDOUT_FILENO, STDERR_FILENO) < 0)) {
     int err = errno;
     cout << "failed to redirect stderr to stdout: " << cpp_strerror(err)
-	 << std::endl;
+         << std::endl;
     return ENOSYS;
   }
 
@@ -216,7 +220,7 @@ int main(int argc, const char **argv)
   // First, let's determine which frontends are configured.
   int flags = CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS;
   global_pre_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
-		  flags);
+          flags);
 
   list<string> frontends;
   get_str_list(g_conf->rgw_frontends, ",", frontends);
@@ -233,11 +237,13 @@ int main(int argc, const char **argv)
       // dropping permissions by setting the appropriate flag.
       flags |= CINIT_FLAG_DEFER_DROP_PRIVILEGES;
       if (f.find("port") != string::npos) {
-	// check for the most common ws problems
-	if ((f.find("port=") == string::npos) ||
-	    (f.find("port= ") != string::npos)) {
-	  derr << "WARNING: civetweb frontend config found unexpected spacing around 'port' (ensure civetweb port parameter has the form 'port=80' with no spaces before or after '=')" << dendl;
-	}
+        // check for the most common ws problems
+        if ((f.find("port=") == string::npos) ||
+            (f.find("port= ") != string::npos)) {
+          derr << "WARNING: civetweb frontend config found unexpected spacing around 'port' "
+               << "(ensure civetweb port parameter has the form 'port=80' with no spaces "
+               << "before or after '=')" << dendl;
+        }
       }
     }
 
@@ -257,14 +263,35 @@ int main(int argc, const char **argv)
   // Now that we've determined which frontend(s) to use, continue with global
   // initialization. Passing false as the final argument ensures that
   // global_pre_init() is not invoked twice.
-  global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
-	      flags, "rgw_data", false);
+  // claim the reference and release it after subsequent destructors have fired
+  auto cct = global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_DAEMON,
+			 flags, "rgw_data", false);
 
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ++i) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
       usage();
       return 0;
     }
+  }
+
+  // maintain existing region root pool for new multisite objects
+  if (!g_conf->rgw_region_root_pool.empty()) {
+    const char *root_pool = g_conf->rgw_region_root_pool.c_str();
+    if (g_conf->rgw_zonegroup_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_zonegroup_root_pool", root_pool);
+    }
+    if (g_conf->rgw_period_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_period_root_pool", root_pool);
+    }
+    if (g_conf->rgw_realm_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_realm_root_pool", root_pool);
+    }
+  }
+
+  // for region -> zonegroup conversion (must happen before common_init_finish())
+  if (!g_conf->rgw_region.empty() && g_conf->rgw_zonegroup.empty()) {
+    g_conf->set_val_or_die("rgw_zonegroup", g_conf->rgw_region.c_str());
   }
 
   check_curl();
@@ -284,20 +311,22 @@ int main(int argc, const char **argv)
 
   common_init_finish(g_ceph_context);
 
-  // claim the reference and release it after subsequent destructors have fired
-  boost::intrusive_ptr<CephContext> cct(g_ceph_context, false);
-
-  rgw_tools_init(g_ceph_context);
+  int r = rgw_tools_init(g_ceph_context);
+  if (r < 0) {
+    derr << "ERROR: unable to initialize rgw tools" << dendl;
+    return -r;
+  }
 
   rgw_init_resolver();
   
   curl_global_init(CURL_GLOBAL_ALL);
   
+#if defined(WITH_RADOSGW_FCGI_FRONTEND)
   FCGX_Init();
+#endif
 
-  int r = 0;
   RGWRados *store = RGWStoreManager::get_storage(g_ceph_context,
-      g_conf->rgw_enable_gc_threads, g_conf->rgw_enable_quota_threads,
+      g_conf->rgw_enable_gc_threads, g_conf->rgw_enable_lc_threads, g_conf->rgw_enable_quota_threads,
       g_conf->rgw_run_sync_thread);
   if (!store) {
     mutex.Lock();
@@ -309,6 +338,10 @@ int main(int argc, const char **argv)
     return EIO;
   }
   r = rgw_perf_start(g_ceph_context);
+  if (r < 0) {
+    derr << "ERROR: failed starting rgw perf" << dendl;
+    return -r;
+  }
 
   rgw_rest_init(g_ceph_context, store, store->get_zonegroup());
 
@@ -316,9 +349,6 @@ int main(int argc, const char **argv)
   init_timer.cancel_all_events();
   init_timer.shutdown();
   mutex.Unlock();
-
-  if (r) 
-    return 1;
 
   rgw_user_init(store);
   rgw_bucket_init(store->meta_mgr);
@@ -336,18 +366,51 @@ int main(int argc, const char **argv)
   }
 
   // S3 website mode is a specialization of S3
-  bool s3website_enabled = apis_map.count("s3website") > 0;
-  if (apis_map.count("s3") > 0 || s3website_enabled)
-    rest.register_default_mgr(set_logging(new RGWRESTMgr_S3(s3website_enabled)));
-
-  if (apis_map.count("swift") > 0) {
-    rest.register_resource(g_conf->rgw_swift_url_prefix,
-			   set_logging(new RGWRESTMgr_SWIFT));
+  const bool s3website_enabled = apis_map.count("s3website") > 0;
+  // Swift API entrypoint could placed in the root instead of S3
+  const bool swift_at_root = g_conf->rgw_swift_url_prefix == "/";
+  if (apis_map.count("s3") > 0 || s3website_enabled) {
+    if (! swift_at_root) {
+      rest.register_default_mgr(set_logging(new RGWRESTMgr_S3(s3website_enabled)));
+    } else {
+      derr << "Cannot have the S3 or S3 Website enabled together with "
+           << "Swift API placed in the root of hierarchy" << dendl;
+      return EINVAL;
+    }
   }
 
-  if (apis_map.count("swift_auth") > 0)
+  if (apis_map.count("swift") > 0) {
+    RGWRESTMgr_SWIFT* const swift_resource = new RGWRESTMgr_SWIFT;
+
+    if (! g_conf->rgw_cross_domain_policy.empty()) {
+      swift_resource->register_resource("crossdomain.xml",
+                          set_logging(new RGWRESTMgr_SWIFT_CrossDomain));
+    }
+
+    swift_resource->register_resource("healthcheck",
+                          set_logging(new RGWRESTMgr_SWIFT_HealthCheck));
+
+    swift_resource->register_resource("info",
+                          set_logging(new RGWRESTMgr_SWIFT_Info));
+
+    if (! swift_at_root) {
+      rest.register_resource(g_conf->rgw_swift_url_prefix,
+                          set_logging(swift_resource));
+    } else {
+      if (store->get_zonegroup().zones.size() > 1) {
+        derr << "Placing Swift API in the root of URL hierarchy while running"
+             << " multi-site configuration requires another instance of RadosGW"
+             << " with S3 API enabled!" << dendl;
+      }
+
+      rest.register_default_mgr(set_logging(swift_resource));
+    }
+  }
+
+  if (apis_map.count("swift_auth") > 0) {
     rest.register_resource(g_conf->rgw_swift_auth_entry,
-			   set_logging(new RGWRESTMgr_SWIFT_Auth));
+               set_logging(new RGWRESTMgr_SWIFT_Auth));
+  }
 
   if (apis_map.count("admin") > 0) {
     RGWRESTMgr_Admin *admin_resource = new RGWRESTMgr_Admin;
@@ -364,6 +427,9 @@ int main(int argc, const char **argv)
     admin_resource->register_resource("realm", new RGWRESTMgr_Realm);
     rest.register_resource(g_conf->rgw_admin_entry, admin_resource);
   }
+
+  /* Header custom behavior */
+  rest.register_x_headers(g_conf->rgw_log_http_headers);
 
   OpsLogSocket *olog = NULL;
 
@@ -391,26 +457,48 @@ int main(int argc, const char **argv)
        fiter != fe_map.end(); ++fiter) {
     RGWFrontendConfig *config = fiter->second;
     string framework = config->get_framework();
-    RGWFrontend *fe;
+    RGWFrontend *fe = NULL;
+#if defined(WITH_RADOSGW_ASIO_FRONTEND)
+    if ((framework == "asio") &&
+	cct->check_experimental_feature_enabled("rgw-asio-frontend")) {
+      int port;
+      config->get_val("port", 80, &port);
+      std::string uri_prefix;
+      config->get_val("prefix", "", &uri_prefix);
+      RGWProcessEnv env{ store, &rest, olog, port, uri_prefix };
+      fe = new RGWAsioFrontend(env);
+    }
+#endif /* WITH_RADOSGW_ASIO_FRONTEND */
+#if defined(WITH_RADOSGW_FCGI_FRONTEND)
     if (framework == "fastcgi" || framework == "fcgi") {
-      RGWProcessEnv fcgi_pe = { store, &rest, olog, 0 };
+      std::string uri_prefix;
+      config->get_val("prefix", "", &uri_prefix);
+      RGWProcessEnv fcgi_pe = { store, &rest, olog, 0, uri_prefix };
 
       fe = new RGWFCGXFrontend(fcgi_pe, config);
-    } else if (framework == "civetweb" || framework == "mongoose") {
+    }
+#endif /* WITH_RADOSGW_FCGI_FRONTEND */
+    if (framework == "civetweb" || framework == "mongoose") {
       int port;
       config->get_val("port", 80, &port);
+      std::string uri_prefix;
+      config->get_val("prefix", "", &uri_prefix);
 
-      RGWProcessEnv env = { store, &rest, olog, port };
+      RGWProcessEnv env = { store, &rest, olog, 0, uri_prefix };
 
-      fe = new RGWMongooseFrontend(env, config);
-    } else if (framework == "loadgen") {
+      fe = new RGWCivetWebFrontend(env, config);
+    }
+    if (framework == "loadgen") {
       int port;
       config->get_val("port", 80, &port);
+      std::string uri_prefix;
+      config->get_val("prefix", "", &uri_prefix);
 
-      RGWProcessEnv env = { store, &rest, olog, port };
+      RGWProcessEnv env = { store, &rest, olog, port, uri_prefix };
 
       fe = new RGWLoadGenFrontend(env, config);
-    } else {
+    }
+    if (fe == NULL) {
       dout(0) << "WARNING: skipping unknown framework: " << framework << dendl;
       continue;
     }

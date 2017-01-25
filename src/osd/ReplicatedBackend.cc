@@ -21,7 +21,9 @@
 #include "messages/MOSDPGPush.h"
 #include "messages/MOSDPGPull.h"
 #include "messages/MOSDPGPushReply.h"
+#include "common/EventTrace.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_osd
 #define DOUT_PREFIX_ARGS this
 #undef dout_prefix
@@ -30,11 +32,59 @@ static ostream& _prefix(std::ostream *_dout, ReplicatedBackend *pgb) {
   return *_dout << pgb->get_parent()->gen_dbg_prefix();
 }
 
+namespace {
+class PG_SendMessageOnConn: public Context {
+  PGBackend::Listener *pg;
+  Message *reply;
+  ConnectionRef conn;
+  public:
+  PG_SendMessageOnConn(
+    PGBackend::Listener *pg,
+    Message *reply,
+    ConnectionRef conn) : pg(pg), reply(reply), conn(conn) {}
+  void finish(int) {
+    pg->send_message_osd_cluster(reply, conn.get());
+  }
+};
+
+class PG_RecoveryQueueAsync : public Context {
+  PGBackend::Listener *pg;
+  GenContext<ThreadPool::TPHandle&> *c;
+  public:
+  PG_RecoveryQueueAsync(
+    PGBackend::Listener *pg,
+    GenContext<ThreadPool::TPHandle&> *c) : pg(pg), c(c) {}
+  void finish(int) {
+    pg->schedule_recovery_work(c);
+  }
+};
+}
+
+struct ReplicatedBackend::C_OSD_RepModifyApply : public Context {
+  ReplicatedBackend *pg;
+  RepModifyRef rm;
+  C_OSD_RepModifyApply(ReplicatedBackend *pg, RepModifyRef r)
+    : pg(pg), rm(r) {}
+  void finish(int r) {
+    pg->sub_op_modify_applied(rm);
+  }
+};
+
+struct ReplicatedBackend::C_OSD_RepModifyCommit : public Context {
+  ReplicatedBackend *pg;
+  RepModifyRef rm;
+  C_OSD_RepModifyCommit(ReplicatedBackend *pg, RepModifyRef r)
+    : pg(pg), rm(r) {}
+  void finish(int r) {
+    pg->sub_op_modify_commit(rm);
+  }
+};
+
 static void log_subop_stats(
   PerfCounters *logger,
   OpRequestRef op, int subop)
 {
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now();
   utime_t latency = now;
   latency -= op->get_req()->get_recv_stamp();
 
@@ -65,8 +115,7 @@ ReplicatedBackend::ReplicatedBackend(
   ObjectStore::CollectionHandle &c,
   ObjectStore *store,
   CephContext *cct) :
-  PGBackend(pg, store, coll, c),
-  cct(cct) {}
+  PGBackend(cct, pg, store, coll, c) {}
 
 void ReplicatedBackend::run_recovery_op(
   PGBackend::RecoveryHandle *_h,
@@ -107,7 +156,7 @@ void ReplicatedBackend::recover_object(
   }
 }
 
-void ReplicatedBackend::check_recovery_sources(const OSDMapRef osdmap)
+void ReplicatedBackend::check_recovery_sources(const OSDMapRef& osdmap)
 {
   for(map<pg_shard_t, set<hobject_t, hobject_t::BitwiseComparator> >::iterator i = pull_from_peer.begin();
       i != pull_from_peer.end();
@@ -118,9 +167,8 @@ void ReplicatedBackend::check_recovery_sources(const OSDMapRef osdmap)
       for (set<hobject_t, hobject_t::BitwiseComparator>::iterator j = i->second.begin();
 	   j != i->second.end();
 	   ++j) {
-	assert(pulling.count(*j) == 1);
 	get_parent()->cancel_pull(*j);
-	pulling.erase(*j);
+	clear_pull(pulling.find(*j), false);
       }
       pull_from_peer.erase(i++);
     } else {
@@ -226,7 +274,16 @@ bool ReplicatedBackend::handle_message(
 void ReplicatedBackend::clear_recovery_state()
 {
   // clear pushing/pulling maps
+  for (auto &&i: pushing) {
+    for (auto &&j: i.second) {
+      get_parent()->release_locks(j.second.lock_manager);
+    }
+  }
   pushing.clear();
+
+  for (auto &&i: pulling) {
+    get_parent()->release_locks(i.second.lock_manager);
+  }
   pulling.clear();
   pull_from_peer.clear();
 }
@@ -303,222 +360,6 @@ void ReplicatedBackend::objects_read_async(
       new AsyncReadCallback(r, on_complete)));
 }
 
-
-class RPGTransaction : public PGBackend::PGTransaction {
-  coll_t coll;
-  set<hobject_t, hobject_t::BitwiseComparator> temp_added;
-  set<hobject_t, hobject_t::BitwiseComparator> temp_cleared;
-  mutable ObjectStore::Transaction t;
-  uint64_t written;
-  const coll_t &get_coll_ct(const hobject_t &hoid) {
-    if (hoid.is_temp()) {
-      temp_cleared.erase(hoid);
-      temp_added.insert(hoid);
-    }
-    return get_coll(hoid);
-  }
-  const coll_t &get_coll_rm(const hobject_t &hoid) {
-    if (hoid.is_temp()) {
-      temp_added.erase(hoid);
-      temp_cleared.insert(hoid);
-    }
-    return get_coll(hoid);
-  }
-  const coll_t &get_coll(const hobject_t &hoid) {
-    return coll;
-  }
-public:
-  RPGTransaction(coll_t coll)
-    : coll(coll), written(0) {}
-
-  /// Yields ownership of contained transaction
-  ObjectStore::Transaction&& get_transaction() {
-    return std::move(t);
-  }
-  const set<hobject_t, hobject_t::BitwiseComparator> &get_temp_added() {
-    return temp_added;
-  }
-  const set<hobject_t, hobject_t::BitwiseComparator> &get_temp_cleared() {
-    return temp_cleared;
-  }
-
-  void write(
-    const hobject_t &hoid,
-    uint64_t off,
-    uint64_t len,
-    bufferlist &bl,
-    uint32_t fadvise_flags
-    ) {
-    written += len;
-    t.write(get_coll_ct(hoid), ghobject_t(hoid), off, len, bl, fadvise_flags);
-  }
-  void remove(
-    const hobject_t &hoid
-    ) {
-    t.remove(get_coll_rm(hoid), ghobject_t(hoid));
-  }
-  void stash(
-    const hobject_t &hoid,
-    version_t former_version) {
-    t.collection_move_rename(
-      coll, ghobject_t(hoid), coll,
-      ghobject_t(hoid, former_version, shard_id_t::NO_SHARD));
-  }
-  void setattrs(
-    const hobject_t &hoid,
-    map<string, bufferlist> &attrs
-    ) {
-    t.setattrs(get_coll(hoid), ghobject_t(hoid), attrs);
-  }
-  void setattr(
-    const hobject_t &hoid,
-    const string &attrname,
-    bufferlist &bl
-    ) {
-    t.setattr(get_coll(hoid), ghobject_t(hoid), attrname, bl);
-  }
-  void rmattr(
-    const hobject_t &hoid,
-    const string &attrname
-    ) {
-    t.rmattr(get_coll(hoid), ghobject_t(hoid), attrname);
-  }
-  void omap_setkeys(
-    const hobject_t &hoid,
-    map<string, bufferlist> &keys
-    ) {
-    for (map<string, bufferlist>::iterator p = keys.begin(); p != keys.end(); ++p)
-      written += p->first.length() + p->second.length();
-    return t.omap_setkeys(get_coll(hoid), ghobject_t(hoid), keys);
-  }
-  void omap_setkeys(
-    const hobject_t &hoid,
-    bufferlist &keys_bl
-    ) {
-    written += keys_bl.length();
-    return t.omap_setkeys(get_coll(hoid), ghobject_t(hoid), keys_bl);
-  }
-  void omap_rmkeys(
-    const hobject_t &hoid,
-    set<string> &keys
-    ) {
-    t.omap_rmkeys(get_coll(hoid), ghobject_t(hoid), keys);
-  }
-  void omap_rmkeys(
-    const hobject_t &hoid,
-    bufferlist &keys_bl
-    ) {
-    t.omap_rmkeys(get_coll(hoid), ghobject_t(hoid), keys_bl);
-  }
-  void omap_clear(
-    const hobject_t &hoid
-    ) {
-    t.omap_clear(get_coll(hoid), ghobject_t(hoid));
-  }
-  void omap_setheader(
-    const hobject_t &hoid,
-    bufferlist &header
-    ) {
-    written += header.length();
-    t.omap_setheader(get_coll(hoid), ghobject_t(hoid), header);
-  }
-  void clone_range(
-    const hobject_t &from,
-    const hobject_t &to,
-    uint64_t fromoff,
-    uint64_t len,
-    uint64_t tooff
-    ) {
-    assert(get_coll(from) == get_coll_ct(to)  && get_coll(from) == coll);
-    t.clone_range(coll, ghobject_t(from), ghobject_t(to), fromoff, len, tooff);
-  }
-  void clone(
-    const hobject_t &from,
-    const hobject_t &to
-    ) {
-    assert(get_coll(from) == get_coll_ct(to)  && get_coll(from) == coll);
-    t.clone(coll, ghobject_t(from), ghobject_t(to));
-  }
-  void rename(
-    const hobject_t &from,
-    const hobject_t &to
-    ) {
-    t.collection_move_rename(
-      get_coll_rm(from),
-      ghobject_t(from),
-      get_coll_ct(to),
-      ghobject_t(to));
-  }
-
-  void touch(
-    const hobject_t &hoid
-    ) {
-    t.touch(get_coll_ct(hoid), ghobject_t(hoid));
-  }
-
-  void truncate(
-    const hobject_t &hoid,
-    uint64_t off
-    ) {
-    t.truncate(get_coll(hoid), ghobject_t(hoid), off);
-  }
-  void zero(
-    const hobject_t &hoid,
-    uint64_t off,
-    uint64_t len
-    ) {
-    t.zero(get_coll(hoid), ghobject_t(hoid), off, len);
-  }
-
-  void set_alloc_hint(
-    const hobject_t &hoid,
-    uint64_t expected_object_size,
-    uint64_t expected_write_size,
-    uint32_t flags
-    ) {
-    t.set_alloc_hint(get_coll(hoid), ghobject_t(hoid), expected_object_size,
-		     expected_write_size, flags);
-  }
-
-  using PGBackend::PGTransaction::append;
-  void append(
-    PGTransaction *_to_append
-    ) {
-    RPGTransaction *to_append = dynamic_cast<RPGTransaction*>(_to_append);
-    assert(to_append);
-    written += to_append->written;
-    to_append->written = 0;
-    t.append((to_append->t));
-    for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = to_append->temp_added.begin();
-	 i != to_append->temp_added.end();
-	 ++i) {
-      temp_cleared.erase(*i);
-      temp_added.insert(*i);
-    }
-    for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = to_append->temp_cleared.begin();
-	 i != to_append->temp_cleared.end();
-	 ++i) {
-      temp_added.erase(*i);
-      temp_cleared.insert(*i);
-    }
-  }
-  void nop() {
-    t.nop();
-  }
-  bool empty() const {
-    return t.empty(); 
-  }
-  uint64_t get_bytes_written() const {
-    return written;
-  }
-  ~RPGTransaction() { }
-};
-
-PGBackend::PGTransaction *ReplicatedBackend::get_transaction()
-{
-  return new RPGTransaction(coll);
-}
-
 class C_OSD_OnOpCommit : public Context {
   ReplicatedBackend *pg;
   ReplicatedBackend::InProgressOp *op;
@@ -541,13 +382,160 @@ public:
   }
 };
 
+void generate_transaction(
+  PGTransactionUPtr &pgt,
+  const coll_t &coll,
+  bool legacy_log_entries,
+  vector<pg_log_entry_t> &log_entries,
+  ObjectStore::Transaction *t,
+  set<hobject_t, hobject_t::BitwiseComparator> *added,
+  set<hobject_t, hobject_t::BitwiseComparator> *removed)
+{
+  assert(t);
+  assert(added);
+  assert(removed);
+
+  for (auto &&le: log_entries) {
+    le.mark_unrollbackable();
+    auto oiter = pgt->op_map.find(le.soid);
+    if (oiter != pgt->op_map.end() && oiter->second.updated_snaps) {
+      vector<snapid_t> snaps(
+	oiter->second.updated_snaps->second.begin(),
+	oiter->second.updated_snaps->second.end());
+      ::encode(snaps, le.snaps);
+    }
+  }
+
+  pgt->safe_create_traverse(
+    [&](pair<const hobject_t, PGTransaction::ObjectOperation> &obj_op) {
+      const hobject_t &oid = obj_op.first;
+      const ghobject_t goid =
+	ghobject_t(oid, ghobject_t::NO_GEN, shard_id_t::NO_SHARD);
+      const PGTransaction::ObjectOperation &op = obj_op.second;
+
+      if (oid.is_temp()) {
+	if (op.is_fresh_object()) {
+	  added->insert(oid);
+	} else if (op.is_delete()) {
+	  removed->insert(oid);
+	}
+      }
+
+      if (op.delete_first) {
+	t->remove(coll, goid);
+      }
+
+      match(
+	op.init_type,
+	[&](const PGTransaction::ObjectOperation::Init::None &) {
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Create &op) {
+	  t->touch(coll, goid);
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Clone &op) {
+	  t->clone(
+	    coll,
+	    ghobject_t(
+	      op.source, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	    goid);
+	},
+	[&](const PGTransaction::ObjectOperation::Init::Rename &op) {
+	  assert(op.source.is_temp());
+	  t->collection_move_rename(
+	    coll,
+	    ghobject_t(
+	      op.source, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	    coll,
+	    goid);
+	});
+
+      if (op.truncate) {
+	t->truncate(coll, goid, op.truncate->first);
+	if (op.truncate->first != op.truncate->second)
+	  t->truncate(coll, goid, op.truncate->second);
+      }
+
+      if (!op.attr_updates.empty()) {
+	map<string, bufferlist> attrs;
+	for (auto &&p: op.attr_updates) {
+	  if (p.second)
+	    attrs[p.first] = *(p.second);
+	  else
+	    t->rmattr(coll, goid, p.first);
+	}
+	t->setattrs(coll, goid, attrs);
+      }
+
+      if (op.clear_omap)
+	t->omap_clear(coll, goid);
+      if (op.omap_header)
+	t->omap_setheader(coll, goid, *(op.omap_header));
+
+      for (auto &&up: op.omap_updates) {
+	using UpdateType = PGTransaction::ObjectOperation::OmapUpdateType;
+	switch (up.first) {
+	case UpdateType::Remove:
+	  t->omap_rmkeys(coll, goid, up.second);
+	  break;
+	case UpdateType::Insert:
+	  t->omap_setkeys(coll, goid, up.second);
+	  break;
+	}
+      }
+
+      // updated_snaps doesn't matter since we marked unrollbackable
+
+      if (op.alloc_hint) {
+	auto &hint = *(op.alloc_hint);
+	t->set_alloc_hint(
+	  coll,
+	  goid,
+	  hint.expected_object_size,
+	  hint.expected_write_size,
+	  hint.flags);
+      }
+
+      for (auto &&extent: op.buffer_updates) {
+	using BufferUpdate = PGTransaction::ObjectOperation::BufferUpdate;
+	match(
+	  extent.get_val(),
+	  [&](const BufferUpdate::Write &op) {
+	    t->write(
+	      coll,
+	      goid,
+	      extent.get_off(),
+	      extent.get_len(),
+	      op.buffer);
+	  },
+	  [&](const BufferUpdate::Zero &op) {
+	    t->zero(
+	      coll,
+	      goid,
+	      extent.get_off(),
+	      extent.get_len());
+	  },
+	  [&](const BufferUpdate::CloneRange &op) {
+	    assert(op.len == extent.get_len());
+	    t->clone_range(
+	      coll,
+	      ghobject_t(op.from, ghobject_t::NO_GEN, shard_id_t::NO_SHARD),
+	      goid,
+	      op.offset,
+	      extent.get_len(),
+	      extent.get_off());
+	  });
+      }
+    });
+}
+
 void ReplicatedBackend::submit_transaction(
   const hobject_t &soid,
+  const object_stat_sum_t &delta_stats,
   const eversion_t &at_version,
   PGTransactionUPtr &&_t,
   const eversion_t &trim_to,
-  const eversion_t &trim_rollback_to,
-  const vector<pg_log_entry_t> &log_entries,
+  const eversion_t &roll_forward_to,
+  const vector<pg_log_entry_t> &_log_entries,
   boost::optional<pg_hit_set_history_t> &hset_history,
   Context *on_local_applied_sync,
   Context *on_all_acked,
@@ -556,13 +544,24 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
-  std::unique_ptr<RPGTransaction> t(
-    static_cast<RPGTransaction*>(_t.release()));
-  assert(t);
-  ObjectStore::Transaction op_t = t->get_transaction();
+  parent->apply_stats(
+    soid,
+    delta_stats);
 
-  assert(t->get_temp_added().size() <= 1);
-  assert(t->get_temp_cleared().size() <= 1);
+  vector<pg_log_entry_t> log_entries(_log_entries);
+  ObjectStore::Transaction op_t;
+  PGTransactionUPtr t(std::move(_t));
+  set<hobject_t, hobject_t::BitwiseComparator> added, removed;
+  generate_transaction(
+    t,
+    coll,
+    !get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN),
+    log_entries,
+    &op_t,
+    &added,
+    &removed);
+  assert(added.size() <= 1);
+  assert(removed.size() <= 1);
 
   assert(!in_progress_ops.count(tid));
   InProgressOp &op = in_progress_ops.insert(
@@ -581,32 +580,28 @@ void ReplicatedBackend::submit_transaction(
     parent->get_actingbackfill_shards().begin(),
     parent->get_actingbackfill_shards().end());
 
-
   issue_op(
     soid,
     at_version,
     tid,
     reqid,
     trim_to,
-    trim_rollback_to,
-    t->get_temp_added().empty() ? hobject_t() : *(t->get_temp_added().begin()),
-    t->get_temp_cleared().empty() ?
-      hobject_t() : *(t->get_temp_cleared().begin()),
+    at_version,
+    added.size() ? *(added.begin()) : hobject_t(),
+    removed.size() ? *(removed.begin()) : hobject_t(),
     log_entries,
     hset_history,
     &op,
     op_t);
 
-  if (!(t->get_temp_added().empty())) {
-    add_temp_objs(t->get_temp_added());
-  }
-  clear_temp_objs(t->get_temp_cleared());
+  add_temp_objs(added);
+  clear_temp_objs(removed);
 
   parent->log_operation(
     log_entries,
     hset_history,
     trim_to,
-    trim_rollback_to,
+    at_version,
     true,
     op_t);
   
@@ -627,6 +622,8 @@ void ReplicatedBackend::submit_transaction(
 void ReplicatedBackend::op_applied(
   InProgressOp *op)
 {
+  FUNCTRACE();
+  OID_EVENT_TRACE_WITH_MSG((op && op->op) ? op->op->get_req() : NULL, "OP_APPLIED_BEGIN", true);
   dout(10) << __func__ << ": " << op->tid << dendl;
   if (op->op)
     op->op->mark_event("op_applied");
@@ -647,6 +644,8 @@ void ReplicatedBackend::op_applied(
 void ReplicatedBackend::op_commit(
   InProgressOp *op)
 {
+  FUNCTRACE();
+  OID_EVENT_TRACE_WITH_MSG((op && op->op) ? op->op->get_req() : NULL, "OP_COMMIT_BEGIN", true);
   dout(10) << __func__ << ": " << op->tid << dendl;
   if (op->op)
     op->op->mark_event("op_commit");
@@ -741,7 +740,8 @@ void ReplicatedBackend::be_deep_scrub(
   ScrubMap::object &o,
   ThreadPool::TPHandle &handle)
 {
-  dout(10) << __func__ << " " << poid << " seed " << seed << dendl;
+  dout(10) << __func__ << " " << poid << " seed " 
+	   << std::hex << seed << std::dec << dendl;
   bufferhash h(seed), oh(seed);
   bufferlist bl, hdrbl;
   int r;
@@ -872,25 +872,18 @@ void ReplicatedBackend::_do_push(OpRequestRef op)
 
 struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
   ReplicatedBackend *bc;
-  list<hobject_t> to_continue;
+  list<ReplicatedBackend::pull_complete_info> to_continue;
   int priority;
   C_ReplicatedBackend_OnPullComplete(ReplicatedBackend *bc, int priority)
     : bc(bc), priority(priority) {}
 
   void finish(ThreadPool::TPHandle &handle) {
     ReplicatedBackend::RPGHandle *h = bc->_open_recovery_op();
-    for (list<hobject_t>::iterator i =
-	   to_continue.begin();
-	 i != to_continue.end();
-	 ++i) {
-      map<hobject_t, ReplicatedBackend::PullInfo, hobject_t::BitwiseComparator>::iterator j =
-	bc->pulling.find(*i);
-      assert(j != bc->pulling.end());
-      if (!bc->start_pushes(*i, j->second.obc, h)) {
+    for (auto &&i: to_continue) {
+      if (!bc->start_pushes(i.hoid, i.obc, h)) {
 	bc->get_parent()->on_global_recover(
-	  *i, j->second.stat);
+	  i.hoid, i.stat);
       }
-      bc->pulling.erase(*i);
       handle.reset_tp_timeout();
     }
     bc->run_recovery_op(h, priority);
@@ -907,7 +900,7 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
 
   vector<PullOp> replies(1);
   ObjectStore::Transaction t;
-  list<hobject_t> to_continue;
+  list<pull_complete_info> to_continue;
   for (vector<PushOp>::iterator i = m->pushes.begin();
        i != m->pushes.end();
        ++i) {
@@ -988,12 +981,11 @@ Message * ReplicatedBackend::generate_subop(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t pg_trim_rollback_to,
+  eversion_t pg_roll_forward_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const vector<pg_log_entry_t> &log_entries,
   boost::optional<pg_hit_set_history_t> &hset_hist,
-  InProgressOp *op,
   ObjectStore::Transaction &op_t,
   pg_shard_t peer,
   const pg_info_t &pinfo)
@@ -1018,6 +1010,7 @@ Message * ReplicatedBackend::generate_subop(
     ::encode(t, wr->get_data());
   } else {
     ::encode(op_t, wr->get_data());
+    wr->get_header().data_off = op_t.get_data_alignment();
   }
 
   ::encode(log_entries, wr->logbl);
@@ -1028,7 +1021,7 @@ Message * ReplicatedBackend::generate_subop(
     wr->pg_stats = get_info().stats;
 
   wr->pg_trim_to = pg_trim_to;
-  wr->pg_trim_rollback_to = pg_trim_rollback_to;
+  wr->pg_roll_forward_to = pg_roll_forward_to;
 
   wr->new_temp_oid = new_temp_oid;
   wr->discard_temp_oid = discard_temp_oid;
@@ -1042,7 +1035,7 @@ void ReplicatedBackend::issue_op(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t pg_trim_rollback_to,
+  eversion_t pg_roll_forward_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const vector<pg_log_entry_t> &log_entries,
@@ -1074,12 +1067,11 @@ void ReplicatedBackend::issue_op(
       tid,
       reqid,
       pg_trim_to,
-      pg_trim_rollback_to,
+      pg_roll_forward_to,
       new_temp_oid,
       discard_temp_oid,
       log_entries,
       hset_hist,
-      op,
       op_t,
       peer,
       pinfo);
@@ -1160,7 +1152,7 @@ void ReplicatedBackend::sub_op_modify(OpRequestRef op)
     log,
     m->updated_hit_set_history,
     m->pg_trim_to,
-    m->pg_trim_rollback_to,
+    m->pg_roll_forward_to,
     update_snaps,
     rm->localt);
 
@@ -1206,7 +1198,7 @@ void ReplicatedBackend::sub_op_modify_applied(RepModifyRef rm)
 	static_cast<MOSDRepOp*>(m), parent->whoami_shard(),
 	0, get_osdmap()->get_epoch(), CEPH_OSD_FLAG_ACK);
   } else {
-    assert(0);
+    ceph_abort();
   }
 
   // send ack to acker only if we haven't sent a commit already
@@ -1251,7 +1243,7 @@ void ReplicatedBackend::sub_op_modify_commit(RepModifyRef rm)
     commit = reply;
   }
   else {
-    assert(0);
+    ceph_abort();
   }
 
   commit->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
@@ -1269,7 +1261,8 @@ void ReplicatedBackend::calc_head_subsets(
   const pg_missing_t& missing,
   const hobject_t &last_backfill,
   interval_set<uint64_t>& data_subset,
-  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets)
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+  ObcLockManager &manager)
 {
   dout(10) << "calc_head_subsets " << head
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
@@ -1299,7 +1292,8 @@ void ReplicatedBackend::calc_head_subsets(
     c.snap = snapset.clones[j];
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
     if (!missing.is_missing(c) &&
-	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0 &&
+	get_parent()->try_lock_for_read(c, manager)) {
       dout(10) << "calc_head_subsets " << head << " has prev " << c
 	       << " overlap " << prev << dendl;
       clone_subsets[c] = prev;
@@ -1313,6 +1307,7 @@ void ReplicatedBackend::calc_head_subsets(
 
   if (cloning.num_intervals() > cct->_conf->osd_recover_clone_overlap_limit) {
     dout(10) << "skipping clone, too many holes" << dendl;
+    get_parent()->release_locks(manager);
     clone_subsets.clear();
     cloning.clear();
   }
@@ -1330,7 +1325,8 @@ void ReplicatedBackend::calc_clone_subsets(
   const pg_missing_t& missing,
   const hobject_t &last_backfill,
   interval_set<uint64_t>& data_subset,
-  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets)
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+  ObcLockManager &manager)
 {
   dout(10) << "calc_clone_subsets " << soid
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
@@ -1364,7 +1360,8 @@ void ReplicatedBackend::calc_clone_subsets(
     c.snap = snapset.clones[j];
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
     if (!missing.is_missing(c) &&
-	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0 &&
+	get_parent()->try_lock_for_read(c, manager)) {
       dout(10) << "calc_clone_subsets " << soid << " has prev " << c
 	       << " overlap " << prev << dendl;
       clone_subsets[c] = prev;
@@ -1384,7 +1381,8 @@ void ReplicatedBackend::calc_clone_subsets(
     c.snap = snapset.clones[j];
     next.intersection_of(snapset.clone_overlap[snapset.clones[j-1]]);
     if (!missing.is_missing(c) &&
-	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0 &&
+	get_parent()->try_lock_for_read(c, manager)) {
       dout(10) << "calc_clone_subsets " << soid << " has next " << c
 	       << " overlap " << next << dendl;
       clone_subsets[c] = next;
@@ -1397,6 +1395,7 @@ void ReplicatedBackend::calc_clone_subsets(
 
   if (cloning.num_intervals() > cct->_conf->osd_recover_clone_overlap_limit) {
     dout(10) << "skipping clone, too many holes" << dendl;
+    get_parent()->release_locks(manager);
     clone_subsets.clear();
     cloning.clear();
   }
@@ -1416,8 +1415,8 @@ void ReplicatedBackend::prepare_pull(
   ObjectContextRef headctx,
   RPGHandle *h)
 {
-  assert(get_parent()->get_local_missing().missing.count(soid));
-  eversion_t _v = get_parent()->get_local_missing().missing.find(
+  assert(get_parent()->get_local_missing().get_items().count(soid));
+  eversion_t _v = get_parent()->get_local_missing().get_items().find(
     soid)->second.need;
   assert(_v == v);
   const map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &missing_loc(
@@ -1437,18 +1436,18 @@ void ReplicatedBackend::prepare_pull(
 
   dout(7) << "pull " << soid
 	  << " v " << v
-	  << " on osds " << *p
+	  << " on osds " << q->second
 	  << " from osd." << fromshard
 	  << dendl;
 
   assert(peer_missing.count(fromshard));
   const pg_missing_t &pmissing = peer_missing.find(fromshard)->second;
   if (pmissing.is_missing(soid, v)) {
-    assert(pmissing.missing.find(soid)->second.have != v);
+    assert(pmissing.get_items().find(soid)->second.have != v);
     dout(10) << "pulling soid " << soid << " from osd " << fromshard
-	     << " at version " << pmissing.missing.find(soid)->second.have
+	     << " at version " << pmissing.get_items().find(soid)->second.have
 	     << " rather than at version " << v << dendl;
-    v = pmissing.missing.find(soid)->second.have;
+    v = pmissing.get_items().find(soid)->second.have;
     assert(get_parent()->get_log().get_log().objects.count(soid) &&
 	   (get_parent()->get_log().get_log().objects.find(soid)->second->op ==
 	    pg_log_entry_t::LOST_REVERT) &&
@@ -1458,6 +1457,7 @@ void ReplicatedBackend::prepare_pull(
   }
 
   ObjectRecoveryInfo recovery_info;
+  ObcLockManager lock_manager;
 
   if (soid.is_snap()) {
     assert(!get_parent()->get_local_missing().is_missing(
@@ -1469,10 +1469,12 @@ void ReplicatedBackend::prepare_pull(
     SnapSetContext *ssc = headctx->ssc;
     assert(ssc);
     dout(10) << " snapset " << ssc->snapset << dendl;
-    calc_clone_subsets(ssc->snapset, soid, get_parent()->get_local_missing(),
-		       get_info().last_backfill,
-		       recovery_info.copy_subset,
-		       recovery_info.clone_subset);
+    calc_clone_subsets(
+      ssc->snapset, soid, get_parent()->get_local_missing(),
+      get_info().last_backfill,
+      recovery_info.copy_subset,
+      recovery_info.clone_subset,
+      lock_manager);
     // FIXME: this may overestimate if we are pulling multiple clones in parallel...
     dout(10) << " pulling " << recovery_info << dendl;
 
@@ -1500,10 +1502,13 @@ void ReplicatedBackend::prepare_pull(
   assert(!pulling.count(soid));
   pull_from_peer[fromshard].insert(soid);
   PullInfo &pi = pulling[soid];
+  pi.from = fromshard;
+  pi.soid = soid;
   pi.head_ctx = headctx;
   pi.recovery_info = op.recovery_info;
   pi.recovery_progress = op.recovery_progress;
   pi.cache_dont_need = h->cache_dont_need;
+  pi.lock_manager = std::move(lock_manager);
 }
 
 /*
@@ -1523,6 +1528,7 @@ void ReplicatedBackend::prep_push_to_replica(
   map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator> clone_subsets;
   interval_set<uint64_t> data_subset;
 
+  ObcLockManager lock_manager;
   // are we doing a clone on the replica?
   if (soid.snap && soid.snap < CEPH_NOSNAP) {
     hobject_t head = soid;
@@ -1551,10 +1557,12 @@ void ReplicatedBackend::prep_push_to_replica(
     map<pg_shard_t, pg_info_t>::const_iterator pi =
       get_parent()->get_shard_info().find(peer);
     assert(pi != get_parent()->get_shard_info().end());
-    calc_clone_subsets(ssc->snapset, soid,
-		       pm->second,
-		       pi->second.last_backfill,
-		       data_subset, clone_subsets);
+    calc_clone_subsets(
+      ssc->snapset, soid,
+      pm->second,
+      pi->second.last_backfill,
+      data_subset, clone_subsets,
+      lock_manager);
   } else if (soid.snap == CEPH_NOSNAP) {
     // pushing head or unversioned object.
     // base this on partially on replica's clones?
@@ -1565,10 +1573,20 @@ void ReplicatedBackend::prep_push_to_replica(
       obc,
       ssc->snapset, soid, get_parent()->get_shard_missing().find(peer)->second,
       get_parent()->get_shard_info().find(peer)->second.last_backfill,
-      data_subset, clone_subsets);
+      data_subset, clone_subsets,
+      lock_manager);
   }
 
-  prep_push(obc, soid, peer, oi.version, data_subset, clone_subsets, pop, cache_dont_need);
+  prep_push(
+    obc,
+    soid,
+    peer,
+    oi.version,
+    data_subset,
+    clone_subsets,
+    pop,
+    cache_dont_need,
+    std::move(lock_manager));
 }
 
 void ReplicatedBackend::prep_push(ObjectContextRef obc,
@@ -1582,7 +1600,7 @@ void ReplicatedBackend::prep_push(ObjectContextRef obc,
 
   prep_push(obc, soid, peer,
 	    obc->obs.oi.version, data_subset, clone_subsets,
-	    pop, cache_dont_need);
+	    pop, cache_dont_need, ObcLockManager());
 }
 
 void ReplicatedBackend::prep_push(
@@ -1592,7 +1610,8 @@ void ReplicatedBackend::prep_push(
   interval_set<uint64_t> &data_subset,
   map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
   PushOp *pop,
-  bool cache_dont_need)
+  bool cache_dont_need,
+  ObcLockManager &&lock_manager)
 {
   get_parent()->begin_peer_recover(peer, soid);
   // take note.
@@ -1608,6 +1627,7 @@ void ReplicatedBackend::prep_push(
   pi.recovery_progress.data_recovered_to = 0;
   pi.recovery_progress.data_complete = 0;
   pi.recovery_progress.omap_complete = 0;
+  pi.lock_manager = std::move(lock_manager);
 
   ObjectRecoveryProgress new_progress;
   int r = build_push_op(pi.recovery_info,
@@ -1683,7 +1703,15 @@ void ReplicatedBackend::submit_push_data(
     t->remove(coll, ghobject_t(target_oid));
     t->touch(coll, ghobject_t(target_oid));
     t->truncate(coll, ghobject_t(target_oid), recovery_info.size);
-    t->omap_setheader(coll, ghobject_t(target_oid), omap_header);
+    if (omap_header.length()) 
+      t->omap_setheader(coll, ghobject_t(target_oid), omap_header);
+
+    bufferlist bv = attrs[OI_ATTR];
+    object_info_t oi(bv);
+    t->set_alloc_hint(coll, ghobject_t(target_oid),
+		      oi.expected_object_size,
+		      oi.expected_write_size,
+		      oi.alloc_hint_flags);
   }
   uint64_t off = 0;
   uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL;
@@ -1738,7 +1766,8 @@ void ReplicatedBackend::submit_push_complete(ObjectRecoveryInfo &recovery_info,
 
 ObjectRecoveryInfo ReplicatedBackend::recalc_subsets(
   const ObjectRecoveryInfo& recovery_info,
-  SnapSetContext *ssc)
+  SnapSetContext *ssc,
+  ObcLockManager &manager)
 {
   if (!recovery_info.soid.snap || recovery_info.soid.snap >= CEPH_NOSNAP)
     return recovery_info;
@@ -1746,17 +1775,19 @@ ObjectRecoveryInfo ReplicatedBackend::recalc_subsets(
   new_info.copy_subset.clear();
   new_info.clone_subset.clear();
   assert(ssc);
-  calc_clone_subsets(ssc->snapset, new_info.soid, get_parent()->get_local_missing(),
-		     get_info().last_backfill,
-		     new_info.copy_subset, new_info.clone_subset);
+  get_parent()->release_locks(manager); // might already have locks
+  calc_clone_subsets(
+    ssc->snapset, new_info.soid, get_parent()->get_local_missing(),
+    get_info().last_backfill,
+    new_info.copy_subset, new_info.clone_subset,
+    manager);
   return new_info;
 }
 
 bool ReplicatedBackend::handle_pull_response(
   pg_shard_t from, PushOp &pop, PullOp *response,
-  list<hobject_t> *to_continue,
-  ObjectStore::Transaction *t
-  )
+  list<pull_complete_info> *to_continue,
+  ObjectStore::Transaction *t)
 {
   interval_set<uint64_t> data_included = pop.data_included;
   bufferlist data;
@@ -1801,7 +1832,10 @@ bool ReplicatedBackend::handle_pull_response(
     }
     pi.obc = get_parent()->get_obc(pi.recovery_info.soid, pop.attrset);
     pi.recovery_info.oi = pi.obc->obs.oi;
-    pi.recovery_info = recalc_subsets(pi.recovery_info, pi.obc->ssc);
+    pi.recovery_info = recalc_subsets(
+      pi.recovery_info,
+      pi.obc->ssc,
+      pi.lock_manager);
   }
 
 
@@ -1832,13 +1866,15 @@ bool ReplicatedBackend::handle_pull_response(
 		   pop.omap_entries,
 		   t);
 
+  pi.stat.num_keys_recovered += pop.omap_entries.size();
+  pi.stat.num_bytes_recovered += data.length();
+
   if (complete) {
-    to_continue->push_back(hoid);
+    pi.stat.num_objects_recovered++;
+    to_continue->push_back({hoid, pi.obc, pi.stat});
     get_parent()->on_local_recover(
       hoid, pi.recovery_info, pi.obc, t);
-    pull_from_peer[from].erase(hoid);
-    if (pull_from_peer[from].empty())
-      pull_from_peer.erase(from);
+    clear_pull(pulling.find(hoid));
     return false;
   } else {
     response->soid = pop.soid;
@@ -1961,8 +1997,16 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
           << dendl;
 
   if (progress.first) {
-    store->omap_get_header(coll, ghobject_t(recovery_info.soid), &out_op->omap_header);
-    store->getattrs(ch, ghobject_t(recovery_info.soid), out_op->attrset);
+    int r = store->omap_get_header(coll, ghobject_t(recovery_info.soid), &out_op->omap_header);
+    if(r < 0) {
+      dout(1) << __func__ << " get omap header failed: " << cpp_strerror(-r) << dendl; 
+      return r;
+    }
+    r = store->getattrs(ch, ghobject_t(recovery_info.soid), out_op->attrset);
+    if(r < 0) {
+      dout(1) << __func__ << " getattrs failed: " << cpp_strerror(-r) << dendl;
+      return r;
+    }
 
     // Debug
     bufferlist bv = out_op->attrset[OI_ATTR];
@@ -1985,11 +2029,14 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
     ObjectMap::ObjectMapIterator iter =
       store->get_omap_iterator(coll,
 			       ghobject_t(recovery_info.soid));
+    assert(iter);
     for (iter->lower_bound(progress.omap_recovered_to);
 	 iter->valid();
 	 iter->next(false)) {
       if (!out_op->omap_entries.empty() &&
-	  available <= (iter->key().size() + iter->value().length()))
+	  ((cct->_conf->osd_recovery_max_omap_entries_per_chunk > 0 &&
+	    out_op->omap_entries.size() >= cct->_conf->osd_recovery_max_omap_entries_per_chunk) ||
+	   available <= iter->key().size() + iter->value().length()))
 	break;
       out_op->omap_entries.insert(make_pair(iter->key(), iter->value()));
 
@@ -2174,6 +2221,7 @@ bool ReplicatedBackend::handle_push_reply(pg_shard_t peer, PushReplyOp &op, Push
       stat.num_keys_recovered = reply->omap_entries.size();
       stat.num_objects_recovered = 1;
 
+      get_parent()->release_locks(pi->lock_manager);
       pushing[soid].erase(peer);
       pi = NULL;
 
@@ -2320,7 +2368,7 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
   if (is_primary()) {
     PullOp resp;
     RPGHandle *h = _open_recovery_op();
-    list<hobject_t> to_continue;
+    list<pull_complete_info> to_continue;
     bool more = handle_pull_response(
       m->from, pop, &resp,
       &to_continue, &t);
@@ -2359,11 +2407,24 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
 
 void ReplicatedBackend::_failed_push(pg_shard_t from, const hobject_t &soid)
 {
-  get_parent()->failed_push(from, soid);
-  pull_from_peer[from].erase(soid);
-  if (pull_from_peer[from].empty())
-    pull_from_peer.erase(from);
-  pulling.erase(soid);
+  list<pg_shard_t> fl = { from };
+  get_parent()->failed_push(fl, soid);
+
+  clear_pull(pulling.find(soid));
+}
+
+void ReplicatedBackend::clear_pull(
+  map<hobject_t, PullInfo, hobject_t::BitwiseComparator>::iterator piter,
+  bool clear_pull_from_peer)
+{
+  auto from = piter->second.from;
+  if (clear_pull_from_peer) {
+    pull_from_peer[from].erase(piter->second.soid);
+    if (pull_from_peer[from].empty())
+      pull_from_peer.erase(from);
+  }
+  get_parent()->release_locks(piter->second.lock_manager);
+  pulling.erase(piter);
 }
 
 int ReplicatedBackend::start_pushes(

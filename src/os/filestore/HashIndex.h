@@ -134,13 +134,14 @@ private:
 public:
   /// Constructor.
   HashIndex(
+    CephContext* cct,
     coll_t collection,     ///< [in] Collection
     const char *base_path, ///< [in] Path to the index root.
     int merge_at,          ///< [in] Merge threshhold.
     int split_multiple,	   ///< [in] Split threshhold.
     uint32_t index_version,///< [in] Index version
     double retry_probability=0) ///< [in] retry probability
-    : LFNIndex(collection, base_path, index_version, retry_probability),
+    : LFNIndex(cct, collection, base_path, index_version, retry_probability),
       merge_threshold(merge_at),
       split_multiplier(split_multiple) {}
 
@@ -159,6 +160,9 @@ public:
     uint32_t bits,
     CollectionIndex* dest
     );
+
+  /// @see CollectionIndex
+  virtual int apply_layout_settings();
 
 protected:
   int _init();
@@ -198,6 +202,11 @@ protected:
     ghobject_t *next
     );
 private:
+  /// Internal recursively remove path and its subdirs
+  int _recursive_remove(
+    const vector<string> &path, ///< [in] path to remove
+    bool top			///< [in] internal tracking of first caller
+    ); /// @return Error Code, 0 on success
   /// Recursively remove path and its subdirs
   int recursive_remove(
     const vector<string> &path ///< [in] path to remove
@@ -427,6 +436,9 @@ private:
   /// Create the given levels of sub directories from the given root.
   /// The contents of *path* is not changed after calling this function.
   int recursive_create_path(vector<string>& path, int level);
+
+  /// split each dir below the given path
+  int split_dirs(const vector<string> &path);
 };
 
 #endif

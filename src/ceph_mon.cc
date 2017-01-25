@@ -45,8 +45,6 @@ using namespace std;
 
 #include "include/assert.h"
 
-#include "erasure-code/ErasureCodePlugin.h"
-
 #define dout_subsys ceph_subsys_mon
 
 Monitor *mon = NULL;
@@ -137,24 +135,20 @@ int check_mon_data_empty()
     cerr << "opendir(" << mon_data << ") " << cpp_strerror(errno) << std::endl;
     return -errno;
   }
-  char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
-
   int code = 0;
-  struct dirent *de;
+  struct dirent *de = nullptr;
   errno = 0;
-  while (!::readdir_r(dir, reinterpret_cast<struct dirent*>(buf), &de)) {
-    if (!de) {
-      if (errno) {
-	cerr << "readdir(" << mon_data << ") " << cpp_strerror(errno) << std::endl;
-	code = -errno;
-      }
-      break;
-    }
+  while ((de = ::readdir(dir))) {
     if (string(".") != de->d_name &&
-	string("..") != de->d_name) {
+	string("..") != de->d_name &&
+	string("kv_backend") != de->d_name) {
       code = -ENOTEMPTY;
       break;
     }
+  }
+  if (!de && errno) {
+    cerr << "readdir(" << mon_data << ") " << cpp_strerror(errno) << std::endl;
+    code = -errno;
   }
 
   ::closedir(dir);
@@ -162,7 +156,7 @@ int check_mon_data_empty()
   return code;
 }
 
-void usage()
+static void usage()
 {
   cerr << "usage: ceph-mon -i monid [flags]" << std::endl;
   cerr << "  --debug_mon n\n";
@@ -186,22 +180,12 @@ void usage()
   generic_server_usage();
 }
 
-int preload_erasure_code()
-{
-  string plugins = g_conf->osd_erasure_code_plugins;
-  stringstream ss;
-  int r = ErasureCodePluginRegistry::instance().preload(
-    plugins,
-    g_conf->erasure_code_dir,
-    &ss);
-  if (r)
-    derr << ss.str() << dendl;
-  else
-    dout(10) << ss.str() << dendl;
-  return r;
-}
-
-int main(int argc, const char **argv) 
+#ifdef BUILDING_FOR_EMBEDDED
+void cephd_preload_embedded_plugins();
+extern "C" int cephd_mon(int argc, const char **argv)
+#else
+int main(int argc, const char **argv)
+#endif
 {
   int err;
 
@@ -257,8 +241,9 @@ int main(int argc, const char **argv)
     }
   }
 
-  global_init(&def_args, args,
-              CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON, flags, "mon_data");
+  auto cct = global_init(&def_args, args,
+			 CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON,
+			 flags, "mon_data");
   ceph_heap_profiler_init();
 
   uuid_d fsid;
@@ -512,8 +497,12 @@ int main(int argc, const char **argv)
     }
     common_init_finish(g_ceph_context);
     global_init_chdir(g_ceph_context);
-    if (preload_erasure_code() < 0)
+#ifndef BUILDING_FOR_EMBEDDED
+    if (global_init_preload_erasure_code(g_ceph_context) < 0)
       prefork.exit(1);
+#else
+    cephd_preload_embedded_plugins();
+#endif
   }
 
   MonitorDBStore *store = new MonitorDBStore(g_conf->mon_data);
@@ -573,7 +562,7 @@ int main(int argc, const char **argv)
     ::encode(v, final);
     ::encode(mapbl, final);
 
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     // save it
     t->put("monmap", v, mapbl);
     t->put("monmap", "latest", final);
@@ -664,7 +653,7 @@ int main(int argc, const char **argv)
   int rank = monmap.get_rank(g_conf->name.get_id());
   Messenger *msgr = Messenger::create(g_ceph_context, g_conf->ms_type,
 				      entity_name_t::MON(rank), "mon",
-				      0, 0, Messenger::HAS_MANY_CONNECTIONS);
+				      0, Messenger::HAS_MANY_CONNECTIONS);
   if (!msgr)
     exit(1);
   msgr->set_cluster_protocol(CEPH_MON_PROTOCOL);
@@ -780,7 +769,6 @@ int main(int argc, const char **argv)
   delete msgr;
   delete client_throttler;
   delete daemon_throttler;
-  g_ceph_context->put();
 
   // cd on exit, so that gmon.out (if any) goes into a separate directory for each node.
   char s[20];

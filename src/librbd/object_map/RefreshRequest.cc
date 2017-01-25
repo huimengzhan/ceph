@@ -2,12 +2,9 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/object_map/RefreshRequest.h"
-#include "cls/rbd/cls_rbd_client.h"
-#include "cls/rbd/cls_rbd_types.h"
 #include "cls/lock/cls_lock_client.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/object_map/InvalidateRequest.h"
@@ -75,7 +72,7 @@ void RefreshRequest<I>::send_lock() {
     return;
   }
 
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   using klass = RefreshRequest<I>;
@@ -99,7 +96,7 @@ Context *RefreshRequest<I>::handle_lock(int *ret_val) {
 template <typename I>
 void RefreshRequest<I>::send_load() {
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   librados::ObjectReadOperation op;
@@ -125,7 +122,7 @@ Context *RefreshRequest<I>::handle_load(int *ret_val) {
                                                   &m_on_disk_object_map);
   }
 
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   if (*ret_val == -EINVAL) {
      // object map is corrupt on-disk -- clear it and properly size it
      // so future IO can keep the object map in sync
@@ -223,7 +220,7 @@ Context *RefreshRequest<I>::handle_resize_invalidate(int *ret_val) {
 template <typename I>
 void RefreshRequest<I>::send_resize() {
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   librados::ObjectWriteOperation op;

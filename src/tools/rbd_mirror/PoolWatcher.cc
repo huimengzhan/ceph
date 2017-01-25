@@ -12,6 +12,7 @@
 
 #include "PoolWatcher.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd::mirror::PoolWatcher: " << this << " " \
@@ -48,6 +49,11 @@ PoolWatcher::~PoolWatcher()
   m_timer.shutdown();
 }
 
+bool PoolWatcher::is_blacklisted() const {
+  assert(m_lock.is_locked());
+  return m_blacklisted;
+}
+
 const PoolWatcher::ImageIds& PoolWatcher::get_images() const
 {
   assert(m_lock.is_locked());
@@ -62,6 +68,9 @@ void PoolWatcher::refresh_images(bool reschedule)
   Mutex::Locker l(m_lock);
   if (r >= 0) {
     m_images = std::move(image_ids);
+  } else if (r == -EBLACKLISTED) {
+    derr << "blacklisted during image refresh" << dendl;
+    m_blacklisted = true;
   }
 
   if (!m_stopping && reschedule) {

@@ -4,11 +4,13 @@
 #include "SnapshotCreateRequest.h"
 #include "common/errno.h"
 #include "cls/rbd/cls_rbd_client.h"
+#include "cls/rbd/cls_rbd_types.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
 #include "osdc/Striper.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd::mirror::image_sync::SnapshotCreateRequest: " \
@@ -24,11 +26,13 @@ using librbd::util::create_rados_safe_callback;
 template <typename I>
 SnapshotCreateRequest<I>::SnapshotCreateRequest(I *local_image_ctx,
                                                 const std::string &snap_name,
+						const cls::rbd::SnapshotNamespace &snap_namespace,
                                                 uint64_t size,
                                                 const librbd::parent_spec &spec,
                                                 uint64_t parent_overlap,
                                                 Context *on_finish)
-  : m_local_image_ctx(local_image_ctx), m_snap_name(snap_name), m_size(size),
+  : m_local_image_ctx(local_image_ctx), m_snap_name(snap_name),
+    m_snap_namespace(snap_namespace), m_size(size),
     m_parent_spec(spec), m_parent_overlap(parent_overlap),
     m_on_finish(on_finish) {
 }
@@ -186,7 +190,9 @@ void SnapshotCreateRequest<I>::send_snap_create() {
     SnapshotCreateRequest<I>, &SnapshotCreateRequest<I>::handle_snap_create>(
       this);
   RWLock::RLocker owner_locker(m_local_image_ctx->owner_lock);
-  m_local_image_ctx->operations->execute_snap_create(m_snap_name.c_str(), ctx,
+  m_local_image_ctx->operations->execute_snap_create(m_snap_name.c_str(),
+						     m_snap_namespace,
+						     ctx,
                                                      0U, true);
 }
 
@@ -222,7 +228,7 @@ void SnapshotCreateRequest<I>::send_create_object_map() {
   librados::snap_t local_snap_id = snap_it->second;
   m_local_image_ctx->snap_lock.put_read();
 
-  std::string object_map_oid(librbd::ObjectMap::object_map_name(
+  std::string object_map_oid(librbd::ObjectMap<>::object_map_name(
     m_local_image_ctx->id, local_snap_id));
   uint64_t object_count = Striper::get_num_objects(m_local_image_ctx->layout,
                                                    m_size);

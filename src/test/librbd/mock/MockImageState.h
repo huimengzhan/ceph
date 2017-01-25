@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #ifndef CEPH_TEST_LIBRBD_MOCK_IMAGE_STATE_H
@@ -13,7 +13,6 @@ namespace librbd {
 struct MockImageState {
   MOCK_CONST_METHOD0(is_refresh_required, bool());
   MOCK_METHOD1(refresh, void(Context*));
-  MOCK_METHOD1(acquire_lock_refresh, void(Context*));
 
   MOCK_METHOD1(open, void(Context*));
 
@@ -21,6 +20,9 @@ struct MockImageState {
   MOCK_METHOD1(close, void(Context*));
 
   MOCK_METHOD2(snap_set, void(const std::string &, Context*));
+
+  MOCK_METHOD1(prepare_lock, void(Context*));
+  MOCK_METHOD0(handle_prepare_lock_complete, void());
 };
 
 } // namespace librbd

@@ -37,7 +37,7 @@ TEST(HTTPManager, SignalThread)
   // send one extra request to test that we don't deadlock
   constexpr size_t num_requests = max_requests + 1;
 
-  for (int i = 0; i < (int)num_requests; i++) {
+  for (size_t i = 0; i < num_requests; i++) {
     RGWHTTPClient client{cct};
     http.add_request(&client, "PUT", "http://127.0.0.1:80");
   }
@@ -48,7 +48,8 @@ int main(int argc, char** argv)
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
 
   curl_global_init(CURL_GLOBAL_ALL);

@@ -550,7 +550,7 @@ void TestMemIoCtxImpl::append_clone(bufferlist& src, bufferlist* dest) {
   if (src.length() > 0) {
     bufferlist::iterator iter = src.begin();
     buffer::ptr ptr;
-    iter.copy(src.length(), ptr);
+    iter.copy_deep(src.length(), ptr);
     dest->append(ptr);
   }
 }
@@ -614,7 +614,7 @@ TestMemRadosClient::SharedFile TestMemIoCtxImpl::get_file(
 
     if (new_version) {
       file->snap_id = snapc.seq;
-      file->mtime = ceph_clock_now(m_client->cct()).sec();
+      file->mtime = ceph_clock_now().sec();
       m_pool->files[oid].push_back(file);
     }
     return file;

@@ -103,7 +103,6 @@ class MMonSync;
 class MMonScrub;
 class MMonProbe;
 struct MMonSubscribe;
-class MAuthRotating;
 struct MRoute;
 struct MForward;
 struct MTimeCheck;
@@ -215,10 +214,15 @@ private:
   set<int> quorum;       // current active set of monitors (if !starting)
   utime_t leader_since;  // when this monitor became the leader, if it is the leader
   utime_t exited_quorum; // time detected as not in quorum; 0 if in
-  uint64_t quorum_features;  ///< intersection of quorum member feature bits
+  /**
+   * Intersection of quorum member's connection feature bits.
+   */
+  uint64_t quorum_con_features;
+  /**
+   * Intersection of quorum members mon-specific feature bits
+   */
+  mon_feature_t quorum_mon_features;
   bufferlist supported_commands_bl; // encoded MonCommands we support
-  bufferlist classic_commands_bl; // encoded MonCommands supported by Dumpling
-  set<int> classic_mons; // set of "classic" monitors; only valid on leader
 
   set<string> outside_quorum;
 
@@ -246,20 +250,6 @@ private:
   void scrub_reset();
   void scrub_update_interval(int secs);
 
-  struct C_Scrub : public Context {
-    Monitor *mon;
-    explicit C_Scrub(Monitor *m) : mon(m) { }
-    void finish(int r) {
-      mon->scrub_start();
-    }
-  };
-  struct C_ScrubTimeout : public Context {
-    Monitor *mon;
-    explicit C_ScrubTimeout(Monitor *m) : mon(m) { }
-    void finish(int r) {
-      mon->scrub_timeout();
-    }
-  };
   Context *scrub_event;       ///< periodic event to trigger scrub (leader)
   Context *scrub_timeout_event;  ///< scrub round timeout (leader)
   void scrub_event_start();
@@ -295,7 +285,7 @@ private:
     SyncProvider() : cookie(0), last_committed(0), full(false) {}
 
     void reset_timeout(CephContext *cct, int grace) {
-      timeout = ceph_clock_now(cct);
+      timeout = ceph_clock_now();
       timeout += grace;
     }
   };
@@ -538,30 +528,7 @@ private:
       *abs = abs_skew;
     return (abs_skew > g_conf->mon_clock_drift_allowed);
   }
-  /**
-   * @}
-   */
-  /**
-   * @defgroup Monitor_h_stats Keep track of monitor statistics
-   * @{
-   */
-  struct MonStatsEntry {
-    // data dir
-    uint64_t kb_total;
-    uint64_t kb_used;
-    uint64_t kb_avail;
-    unsigned int latest_avail_ratio;
-    utime_t last_update;
-  };
 
-  struct MonStats {
-    MonStatsEntry ours;
-    map<entity_inst_t,MonStatsEntry> others;
-  };
-
-  MonStats stats;
-
-  void stats_update();
   /**
    * @}
    */
@@ -584,6 +551,8 @@ private:
   void cancel_probe_timeout();
   void probe_timeout(int r);
 
+  void _apply_compatset_features(CompatSet &new_features);
+
 public:
   epoch_t get_epoch();
   int get_leader() { return leader; }
@@ -594,18 +563,26 @@ public:
       q.push_back(monmap->get_name(*p));
     return q;
   }
-  uint64_t get_quorum_features() const {
-    return quorum_features;
+  uint64_t get_quorum_con_features() const {
+    return quorum_con_features;
+  }
+  mon_feature_t get_quorum_mon_features() const {
+    return quorum_mon_features;
   }
   uint64_t get_required_features() const {
     return required_features;
   }
+  mon_feature_t get_required_mon_features() const {
+    return monmap->get_required_features();
+  }
   void apply_quorum_to_compatset_features();
+  void apply_monmap_to_compatset_features();
   void apply_compatset_features_to_quorum_requirements();
 
 private:
   void _reset();   ///< called from bootstrap, start_, or join_election
   void wait_for_paxos_write();
+  void _finish_svc_election(); ///< called by {win,lose}_election
 public:
   void bootstrap();
   void join_election();
@@ -614,20 +591,16 @@ public:
   // end election (called by Elector)
   void win_election(epoch_t epoch, set<int>& q,
 		    uint64_t features,
-		    const MonCommand *cmdset, int cmdsize,
-		    const set<int> *classic_monitors);
+                    const mon_feature_t& mon_features,
+		    const MonCommand *cmdset, int cmdsize);
   void lose_election(epoch_t epoch, set<int>& q, int l,
-		     uint64_t features); // end election (called by Elector)
+		     uint64_t features,
+                     const mon_feature_t& mon_features);
+  // end election (called by Elector)
   void finish_election();
 
   const bufferlist& get_supported_commands_bl() {
     return supported_commands_bl;
-  }
-  const bufferlist& get_classic_commands_bl() {
-    return classic_commands_bl;
-  }
-  const set<int>& get_classic_mons() {
-    return classic_mons;
   }
 
   void update_logger();
@@ -663,6 +636,10 @@ public:
     return (class LogMonitor*) paxos_service[PAXOS_LOG];
   }
 
+  class MgrMonitor *mgrmon() {
+    return (class MgrMonitor*) paxos_service[PAXOS_MGR];
+  }
+
   friend class Paxos;
   friend class OSDMonitor;
   friend class MDSMonitor;
@@ -676,9 +653,6 @@ public:
   // -- sessions --
   MonSessionMap session_map;
   AdminSocketHook *admin_hook;
-
-  void check_subs();
-  void check_sub(Subscription *sub);
 
   void send_latest_monmap(Connection *con);
 
@@ -887,7 +861,7 @@ public:
   //ms_dispatch handles a lot of logic and we want to reuse it
   //on forwarded messages, so we create a non-locking version for this class
   void _ms_dispatch(Message *m);
-  bool ms_dispatch(Message *m) {
+  bool ms_dispatch(Message *m) override {
     lock.Lock();
     _ms_dispatch(m);
     lock.Unlock();
@@ -900,8 +874,9 @@ public:
   bool ms_verify_authorizer(Connection *con, int peer_type,
 			    int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
 			    bool& isvalid, CryptoKey& session_key);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con) {}
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override {}
+  bool ms_handle_refused(Connection *con) override;
 
   int write_default_keyring(bufferlist& bl);
   void extract_save_mon_key(KeyRing& keyring);
@@ -928,9 +903,9 @@ public:
   static int check_features(MonitorDBStore *store);
 
   // config observer
-  virtual const char** get_tracked_conf_keys() const;
-  virtual void handle_conf_change(const struct md_config_t *conf,
-                                  const std::set<std::string> &changed);
+  const char** get_tracked_conf_keys() const override;
+  void handle_conf_change(const struct md_config_t *conf,
+                          const std::set<std::string> &changed) override;
 
   void update_log_clients();
   int sanitize_options();
@@ -974,7 +949,6 @@ public:
 					  Formatter *f,
 					  bufferlist *rdata);
   void get_locally_supported_monitor_commands(const MonCommand **cmds, int *count);
-  void get_classic_monitor_commands(const MonCommand **cmds, int *count);
   /// the Monitor owns this pointer once you pass it in
   void set_leader_supported_commands(const MonCommand *cmds, int size);
   static bool is_keyring_required();
@@ -987,6 +961,7 @@ public:
 #define CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC CompatSet::Feature(5, "new-style osdmap encoding")
 #define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2 CompatSet::Feature(6, "support isa/lrc erasure code")
 #define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V3 CompatSet::Feature(7, "support shec erasure code")
+#define CEPH_MON_FEATURE_INCOMPAT_KRAKEN CompatSet::Feature(8, "support monmap features")
 // make sure you add your feature to Monitor::get_supported_features
 
 long parse_pos_long(const char *s, ostream *pss = NULL);

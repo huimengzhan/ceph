@@ -14,20 +14,37 @@
 
 // For ceph_timespec
 #include "include/types.h"
-
-#include "ceph_context.h"
 #include "ceph_time.h"
 #include "config.h"
 
+#if defined(DARWIN)
+int clock_gettime(int clk_id, struct timespec *tp)
+{
+  if (clk_id == CALENDAR_CLOCK) {
+    // gettimeofday is much faster than clock_get_time
+    struct timeval now;
+    int ret = gettimeofday(&now, NULL);
+    if (ret)
+      return ret;
+    tp->tv_sec = now.tv_sec;
+    tp->tv_nsec = now.tv_usec * 1000L;
+  } else {
+    clock_serv_t cclock;
+    mach_timespec_t mts;
+
+    host_get_clock_service(mach_host_self(), clk_id, &cclock);
+    clock_get_time(cclock, &mts);
+    mach_port_deallocate(mach_task_self(), cclock);
+
+    tp->tv_sec = mts.tv_sec;
+    tp->tv_nsec = mts.tv_nsec;
+  }
+  return 0;
+}
+#endif
+
 namespace ceph {
   namespace time_detail {
-    real_clock::time_point real_clock::now(const CephContext* cct) noexcept {
-      auto t = now();
-      if (cct)
-	t += make_timespan(cct->_conf->clock_offset);
-      return t;
-    }
-
     void real_clock::to_ceph_timespec(const time_point& t,
 				      struct ceph_timespec& ts) {
       ts.tv_sec = to_time_t(t);
@@ -41,14 +58,6 @@ namespace ceph {
     real_clock::time_point real_clock::from_ceph_timespec(
       const struct ceph_timespec& ts) {
       return time_point(seconds(ts.tv_sec) + nanoseconds(ts.tv_nsec));
-    }
-
-    coarse_real_clock::time_point coarse_real_clock::now(
-      const CephContext* cct) noexcept {
-      auto t = now();
-      if (cct)
-	t += make_timespan(cct->_conf->clock_offset);
-      return t;
     }
 
     void coarse_real_clock::to_ceph_timespec(const time_point& t,
@@ -66,7 +75,7 @@ namespace ceph {
       const struct ceph_timespec& ts) {
       return time_point(seconds(ts.tv_sec) + nanoseconds(ts.tv_nsec));
     }
-  };
+  }
 
   using std::chrono::duration_cast;
   using std::chrono::seconds;

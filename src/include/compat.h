@@ -12,6 +12,8 @@
 #ifndef CEPH_COMPAT_H
 #define CEPH_COMPAT_H
 
+#include "acconfig.h"
+
 #if defined(__FreeBSD__)
 
 /* Make sure that ENODATA is defined in the correct way */
@@ -36,17 +38,12 @@
 #undef ENODATA
 #define ENODATA ENOATTR
 #endif
-
 #ifndef MSG_MORE
 #define	MSG_MORE 0
 #endif
 
 #ifndef O_DSYNC
 #define O_DSYNC O_SYNC
-#endif
-
-#ifndef HOST_NAME_MAX
-#define HOST_NAME_MAX 64
 #endif
 
 // Fix clock accuracy
@@ -57,17 +54,35 @@
 #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
 #endif
 #endif
+#if !defined(CLOCK_REALTIME_COARSE)
+#if defined(CLOCK_REALTIME_FAST)
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME_FAST
+#else
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#endif
 
-/* Fix a small name diff */
-#define pthread_setname_np pthread_set_name_np
 /* And include the extra required include file */
 #include <pthread_np.h>
 
 #endif /* !__FreeBSD__ */
 
-#if defined(__APPLE__)
-/* PATH_MAX */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+/* get PATH_MAX */
 #include <limits.h>
+
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
+
+#ifndef HOST_NAME_MAX
+#ifdef MAXHOSTNAMELEN 
+#define HOST_NAME_MAX MAXHOSTNAMELEN 
+#else
+#define HOST_NAME_MAX 255
+#endif
+#endif
+
 #endif /* __APPLE__ */
 
 /* O_LARGEFILE is not defined/required on OSX/FreeBSD */
@@ -110,6 +125,36 @@
 
 #if defined(_AIX)
 #define MSG_DONTWAIT MSG_NONBLOCK
+#endif
+
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+  #if defined(__APPLE__)
+    #define ceph_pthread_setname(thread, name) ({ \
+      int __result = 0;                         \
+      if (thread == pthread_self())             \
+        __result = pthread_setname_np(name);    \
+      __result; })
+  #else
+    #define ceph_pthread_setname pthread_setname_np
+  #endif
+#elif defined(HAVE_PTHREAD_SET_NAME_NP)
+  /* Fix a small name diff */
+  #define ceph_pthread_setname pthread_set_name_np
+#else
+  /* compiler warning free success noop */
+  #define ceph_pthread_setname(thread, name) ({ \
+    int __i = 0;                              \
+    __i; })
+#endif
+
+#if defined(HAVE_PTHREAD_GETNAME_NP)
+  #define ceph_pthread_getname pthread_getname_np
+#else
+  /* compiler warning free success noop */
+  #define ceph_pthread_getname(thread, name, len) ({ \
+    if (name != NULL)                              \
+      *name = '\0';                                \
+    0; })
 #endif
 
 #endif /* !CEPH_COMPAT_H */

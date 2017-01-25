@@ -29,11 +29,15 @@ class ExtentFreelistManager : public FreelistManager {
   void _dump();
 
 public:
-  ExtentFreelistManager(KeyValueDB *kvdb, std::string prefix) :
+  ExtentFreelistManager(CephContext* cct, KeyValueDB *kvdb,
+			std::string prefix) :
+    FreelistManager(cct),
     kvdb(kvdb),
     prefix(prefix),
     total_free(0) {
   }
+
+  int create(uint64_t size, KeyValueDB::Transaction txn) override;
 
   int init() override;
   void shutdown() override;

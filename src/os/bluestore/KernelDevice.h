@@ -29,7 +29,6 @@ class KernelDevice : public BlockDevice {
   string path;
   FS *fs;
   bool aio, dio;
-  bufferptr zeros;
 
   Mutex debug_lock;
   interval_set<uint64_t> debug_inflight;
@@ -64,8 +63,16 @@ class KernelDevice : public BlockDevice {
 
   int direct_read_unaligned(uint64_t off, uint64_t len, char *buf);
 
+  // stalled aio debugging
+  FS::aio_list_t debug_queue;
+  std::mutex debug_queue_lock;
+  FS::aio_t *debug_oldest = nullptr;
+  utime_t debug_stall_since;
+  void debug_aio_link(FS::aio_t& aio);
+  void debug_aio_unlink(FS::aio_t& aio);
+
 public:
-  KernelDevice(aio_callback_t cb, void *cbpriv);
+  KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv);
 
   void aio_submit(IOContext *ioc) override;
 
@@ -88,7 +95,7 @@ public:
 
   // for managing buffered readers/writers
   int invalidate_cache(uint64_t off, uint64_t len) override;
-  int open(string path) override;
+  int open(const string& path) override;
   void close() override;
 };
 

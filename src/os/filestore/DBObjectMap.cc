@@ -19,6 +19,7 @@
 #include "common/config.h"
 #include "include/assert.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << "filestore "
@@ -148,7 +149,8 @@ string DBObjectMap::ghobject_key(const ghobject_t &oid)
 //   bad: plana8923501-10...4c.3.ffffffffffffffff.2
 // fixed: plana8923501-10...4c.3.CB767F2D.ffffffffffffffff.2
 // returns 0 for false, 1 for true, negative for error
-int DBObjectMap::is_buggy_ghobject_key_v1(const string &in)
+int DBObjectMap::is_buggy_ghobject_key_v1(CephContext* cct,
+					  const string &in)
 {
   int dots = 5;  // skip 5 .'s
   const char *s = in.c_str();
@@ -234,7 +236,7 @@ int DBObjectMap::DBObjectMapIteratorImpl::init()
   if (header->parent) {
     Header parent = map->lookup_parent(header);
     if (!parent) {
-      assert(0);
+      ceph_abort();
       return -EINVAL;
     }
     parent_iter = std::make_shared<DBObjectMapIteratorImpl>(map, parent);
@@ -902,10 +904,10 @@ int DBObjectMap::clone(const ghobject_t &oid,
   {
     Header destination = lookup_map_header(*ltarget, target);
     if (destination) {
-      remove_map_header(*ltarget, target, destination, t);
       if (check_spos(target, destination, spos))
 	return 0;
       destination->num_children--;
+      remove_map_header(*ltarget, target, destination, t);
       _clear(destination, t);
     }
   }
@@ -950,7 +952,7 @@ int DBObjectMap::upgrade_to_v2()
         iter->valid() && count < 300;
         iter->next()) {
       dout(20) << __func__ << " key is " << iter->key() << dendl;
-      int r = is_buggy_ghobject_key_v1(iter->key());
+      int r = is_buggy_ghobject_key_v1(cct, iter->key());
       if (r < 0) {
 	derr << __func__ << " bad key '" << iter->key() << "'" << dendl;
 	return r;
@@ -1141,11 +1143,11 @@ DBObjectMap::Header DBObjectMap::lookup_parent(Header input)
        << " for seq " << input->seq << dendl;
   int r = db->get(sys_parent_prefix(input), keys, &out);
   if (r < 0) {
-    assert(0);
+    ceph_abort();
     return Header();
   }
   if (out.empty()) {
-    assert(0);
+    ceph_abort();
     return Header();
   }
 

@@ -32,8 +32,6 @@ set -x
 PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
 export PATH=$CEPH_BIN:.:$PATH # make sure program from sources are preferred
-export PATH=../ceph-detect-init/virtualenv/bin:$PATH
-export PATH=virtualenv/bin:$PATH
 export LD_LIBRARY_PATH=$CEPH_LIB
 : ${CEPH_DISK:=ceph-disk}
 CEPH_DISK_ARGS=
@@ -60,7 +58,7 @@ function teardown() {
     if ! test -e $dir ; then
         return
     fi
-    kill_daemons
+    kill_daemons $dir
     if [ $(stat -f -c '%T' .) == "btrfs" ]; then
         rm -fr $dir/*/*db
         __teardown_btrfs $dir
@@ -364,7 +362,6 @@ function run() {
     CEPH_ARGS+=" --journal-dio=false"
     CEPH_ARGS+=" --erasure-code-dir=$CEPH_LIB"
     CEPH_ARGS+=" --plugin-dir=$CEPH_LIB"
-    CEPH_ARGS+=" --compression-dir=$CEPH_LIB"
     CEPH_ARGS+=" --log-file=$dir/\$name.log"
     CEPH_ARGS+=" --pid-file=$dir/\$name.pidfile"
     CEPH_ARGS+=" --osd-class-dir=$CEPH_LIB"

@@ -3,10 +3,11 @@
 
 #include "BitmapFreelistManager.h"
 #include "kv/KeyValueDB.h"
-#include "kv.h"
+#include "os/kv.h"
 
 #include "common/debug.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
 #undef dout_prefix
 #define dout_prefix *_dout << "freelist "
@@ -18,7 +19,7 @@ void make_offset_key(uint64_t offset, std::string *key)
 }
 
 struct XorMergeOperator : public KeyValueDB::MergeOperator {
-  virtual void merge_nonexistant(
+  virtual void merge_nonexistent(
     const char *rdata, size_t rlen, std::string *new_value) override {
     *new_value = std::string(rdata, rlen);
   }
@@ -45,20 +46,24 @@ void BitmapFreelistManager::setup_merge_operator(KeyValueDB *db, string prefix)
   db->set_merge_operator(prefix, merge_op);
 }
 
-BitmapFreelistManager::BitmapFreelistManager(KeyValueDB *db,
+BitmapFreelistManager::BitmapFreelistManager(CephContext* cct,
+					     KeyValueDB *db,
 					     string meta_prefix,
 					     string bitmap_prefix)
-  : meta_prefix(meta_prefix),
+  : FreelistManager(cct),
+    meta_prefix(meta_prefix),
     bitmap_prefix(bitmap_prefix),
-    kvdb(db)
+    kvdb(db),
+    enumerate_bl_pos(0)
 {
 }
 
 int BitmapFreelistManager::create(uint64_t new_size, KeyValueDB::Transaction txn)
 {
-  size = new_size;
-  bytes_per_block = g_conf->bdev_block_size;
-  blocks_per_key = g_conf->bluestore_freelist_blocks_per_key;
+  bytes_per_block = cct->_conf->bdev_block_size;
+  assert(ISP2(bytes_per_block));
+  size = P2ALIGN(new_size, bytes_per_block);
+  blocks_per_key = cct->_conf->bluestore_freelist_blocks_per_key;
 
   _init_misc();
 
@@ -160,7 +165,7 @@ void BitmapFreelistManager::_init_misc()
 
   block_mask = ~(bytes_per_block - 1);
 
-  uint64_t bytes_per_key = bytes_per_block * blocks_per_key;
+  bytes_per_key = bytes_per_block * blocks_per_key;
   key_mask = ~(bytes_per_key - 1);
   dout(10) << __func__ << std::hex << " bytes_per_key 0x" << bytes_per_key
 	   << ", key_mask 0x" << key_mask << std::dec
@@ -176,6 +181,7 @@ void BitmapFreelistManager::enumerate_reset()
 {
   std::lock_guard<std::mutex> l(lock);
   enumerate_offset = 0;
+  enumerate_bl_pos = 0;
   enumerate_bl.clear();
 }
 
@@ -184,9 +190,10 @@ int get_next_clear_bit(bufferlist& bl, int start)
   const char *p = bl.c_str();
   int bits = bl.length() << 3;
   while (start < bits) {
-    int byte = start >> 3;
-    unsigned char mask = 1 << (start & 7);
-    if ((p[byte] & mask) == 0) {
+    int which_byte = start / 8;
+    int which_bit = start % 8;
+    unsigned char byte_mask = 1 << which_bit;
+    if ((p[which_byte] & byte_mask) == 0) {
       return start;
     }
     ++start;
@@ -199,9 +206,10 @@ int get_next_set_bit(bufferlist& bl, int start)
   const char *p = bl.c_str();
   int bits = bl.length() << 3;
   while (start < bits) {
-    int byte = start >> 3;
-    unsigned char mask = 1 << (start & 7);
-    if (p[byte] & mask) {
+    int which_byte = start / 8;
+    int which_bit = start % 8;
+    unsigned char byte_mask = 1 << which_bit;
+    if (p[which_byte] & byte_mask) {
       return start;
     }
     ++start;
@@ -214,7 +222,7 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
   std::lock_guard<std::mutex> l(lock);
 
   // initial base case is a bit awkward
-  if (enumerate_offset == 0) {
+  if (enumerate_offset == 0 && enumerate_bl_pos == 0) {
     dout(10) << __func__ << " start" << dendl;
     enumerate_p = kvdb->get_iterator(bitmap_prefix);
     enumerate_p->lower_bound(string());
@@ -225,7 +233,6 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     const char *p = k.c_str();
     _key_decode_u64(p, &enumerate_offset);
     enumerate_bl = enumerate_p->value();
-    enumerate_bl_pos = 0;
     assert(enumerate_offset == 0);
     assert(get_next_set_bit(enumerate_bl, 0) == 0);
   }
@@ -239,7 +246,7 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
   while (true) {
     enumerate_bl_pos = get_next_clear_bit(enumerate_bl, enumerate_bl_pos);
     if (enumerate_bl_pos >= 0) {
-      *offset = get_offset(enumerate_offset, enumerate_bl_pos);
+      *offset = _get_offset(enumerate_offset, enumerate_bl_pos);
       dout(30) << __func__ << " found clear bit, key 0x" << std::hex
 	       << enumerate_offset << " bit 0x" << enumerate_bl_pos
 	       << " offset 0x" << *offset
@@ -251,14 +258,14 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     enumerate_p->next();
     enumerate_bl.clear();
     if (!enumerate_p->valid()) {
-      enumerate_offset += bytes_per_block * blocks_per_key;
+      enumerate_offset += bytes_per_key;
       enumerate_bl_pos = 0;
-      *offset = get_offset(enumerate_offset, enumerate_bl_pos);
+      *offset = _get_offset(enumerate_offset, enumerate_bl_pos);
       break;
     }
     string k = enumerate_p->key();
     const char *p = k.c_str();
-    uint64_t next = enumerate_offset + bytes_per_block * blocks_per_key;
+    uint64_t next = enumerate_offset + bytes_per_key;
     _key_decode_u64(p, &enumerate_offset);
     enumerate_bl = enumerate_p->value();
     enumerate_bl_pos = 0;
@@ -276,15 +283,15 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     while (true) {
       enumerate_bl_pos = get_next_set_bit(enumerate_bl, enumerate_bl_pos);
       if (enumerate_bl_pos >= 0) {
-	end = get_offset(enumerate_offset, enumerate_bl_pos);
+	end = _get_offset(enumerate_offset, enumerate_bl_pos);
 	dout(30) << __func__ << " found set bit, key 0x" << std::hex
 		 << enumerate_offset << " bit 0x" << enumerate_bl_pos
 		 << " offset 0x" << end << std::dec
 		 << dendl;
 	*length = end - *offset;
-       assert((*offset  + *length) <= size);
-       dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
-		<< std::dec << dendl;
+        assert((*offset  + *length) <= size);
+        dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
+		 << std::dec << dendl;
 	return true;
       }
       dout(30) << " no more set bits in 0x" << std::hex << enumerate_offset
@@ -308,6 +315,7 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
 	     << std::dec << dendl;
     enumerate_offset = end;
+    enumerate_bl_pos = blocks_per_key;
     assert((*offset  + *length) <= size);
     return true;
   }
@@ -384,7 +392,7 @@ void BitmapFreelistManager::_verify_range(uint64_t offset, uint64_t length,
 	  ++errors;
 	}
       }
-      first_key += bytes_per_block * blocks_per_key;
+      first_key += bytes_per_key;
     }
     // middle keys
     if (first_key < last_key) {
@@ -411,7 +419,7 @@ void BitmapFreelistManager::_verify_range(uint64_t offset, uint64_t length,
 	    ++errors;
 	  }
 	}
-	first_key += bytes_per_block * blocks_per_key;
+	first_key += bytes_per_key;
       }
     }
     assert(first_key == last_key);
@@ -453,7 +461,7 @@ void BitmapFreelistManager::allocate(
 {
   dout(10) << __func__ << " 0x" << std::hex << offset << "~" << length
 	   << std::dec << dendl;
-  if (g_conf->bluestore_debug_freelist)
+  if (cct->_conf->bluestore_debug_freelist)
     _verify_range(offset, length, 0);
   _xor(offset, length, txn);
 }
@@ -464,7 +472,7 @@ void BitmapFreelistManager::release(
 {
   dout(10) << __func__ << " 0x" << std::hex << offset << "~" << length
 	   << std::dec << dendl;
-  if (g_conf->bluestore_debug_freelist)
+  if (cct->_conf->bluestore_debug_freelist)
     _verify_range(offset, length, 1);
   _xor(offset, length, txn);
 }
@@ -516,20 +524,18 @@ void BitmapFreelistManager::_xor(
       bl.hexdump(*_dout, false);
       *_dout << dendl;
       txn->merge(bitmap_prefix, k, bl);
-      first_key += bytes_per_block * blocks_per_key;
+      first_key += bytes_per_key;
     }
     // middle keys
-    if (first_key < last_key) {
-      while (first_key < last_key) {
-	string k;
-	make_offset_key(first_key, &k);
-	dout(30) << __func__ << " 0x" << std::hex << first_key << std::dec
-		 << ": ";
-	all_set_bl.hexdump(*_dout, false);
-	*_dout << dendl;
-	txn->merge(bitmap_prefix, k, all_set_bl);
-	first_key += bytes_per_block * blocks_per_key;
-      }
+    while (first_key < last_key) {
+      string k;
+      make_offset_key(first_key, &k);
+      dout(30) << __func__ << " 0x" << std::hex << first_key << std::dec
+      	 << ": ";
+      all_set_bl.hexdump(*_dout, false);
+      *_dout << dendl;
+      txn->merge(bitmap_prefix, k, all_set_bl);
+      first_key += bytes_per_key;
     }
     assert(first_key == last_key);
     {

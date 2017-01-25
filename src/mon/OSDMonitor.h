@@ -78,9 +78,7 @@ struct failure_info_t {
 			     MonOpRequestRef op) {
     map<int, failure_reporter_t>::iterator p = reporters.find(who);
     if (p == reporters.end()) {
-      if (max_failed_since == utime_t())
-	max_failed_since = failed_since;
-      else if (max_failed_since < failed_since)
+      if (max_failed_since < failed_since)
 	max_failed_since = failed_since;
       p = reporters.insert(map<int, failure_reporter_t>::value_type(who, failure_reporter_t(failed_since))).first;
     }
@@ -101,17 +99,18 @@ struct failure_info_t {
     }
   }
 
-  void cancel_report(int who) {
+  MonOpRequestRef cancel_report(int who) {
     map<int, failure_reporter_t>::iterator p = reporters.find(who);
     if (p == reporters.end())
-      return;
+      return MonOpRequestRef();
+    MonOpRequestRef ret = p->second.op;
     reporters.erase(p);
-    if (reporters.empty())
-      max_failed_since = utime_t();
+    return ret;
   }
 };
 
 class OSDMonitor : public PaxosService {
+  CephContext *cct;
 public:
   OSDMap osdmap;
 
@@ -130,11 +129,10 @@ private:
 
   bool check_failures(utime_t now);
   bool check_failure(utime_t now, int target_osd, failure_info_t& fi);
+  void force_failure(utime_t now, int target_osd);
 
-  // map thrashing
-  int thrash_map;
-  int thrash_last_up_osd;
-  bool thrash();
+  // the time of last msg(MSG_ALIVE and MSG_PGTEMP) proposed without delay
+  utime_t last_attempted_minwait_time;
 
   bool _have_pending_crush();
   CrushWrapper &_get_stable_crush();
@@ -251,6 +249,7 @@ private:
   bool prepare_boot(MonOpRequestRef op);
   void _booted(MonOpRequestRef op, bool logit);
 
+  void update_up_thru(int from, epoch_t up_thru);
   bool preprocess_alive(MonOpRequestRef op);
   bool prepare_alive(MonOpRequestRef op);
   void _reply_map(MonOpRequestRef op, epoch_t e);
@@ -278,7 +277,11 @@ private:
   int crush_rename_bucket(const string& srcname,
 			  const string& dstname,
 			  ostream *ss);
-  int normalize_profile(ErasureCodeProfile &profile, ostream *ss);
+  void check_legacy_ec_plugin(const string& plugin, 
+			      const string& profile) const;
+  int normalize_profile(const string& profilename, 
+			ErasureCodeProfile &profile,
+			ostream *ss);
   int crush_ruleset_create_erasure(const string &name,
 				   const string &profile,
 				   int *ruleset,
@@ -406,7 +409,6 @@ private:
   bool prepare_command(MonOpRequestRef op);
   bool prepare_command_impl(MonOpRequestRef op, map<string,cmd_vartype>& cmdmap);
 
-  int set_crash_replay_interval(const int64_t pool_id, const uint32_t cri);
   int prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
                                stringstream& ss);
 

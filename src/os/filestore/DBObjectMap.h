@@ -115,9 +115,10 @@ public:
     }
   };
 
-  explicit DBObjectMap(KeyValueDB *db) : db(db), header_lock("DBOBjectMap"),
-           	                         cache_lock("DBObjectMap::CacheLock"),
-      	                                 caches(g_conf->filestore_omap_header_cache_size)
+  DBObjectMap(CephContext* cct, KeyValueDB *db)
+    : ObjectMap(cct), db(db), header_lock("DBOBjectMap"),
+      cache_lock("DBObjectMap::CacheLock"),
+      caches(cct->_conf->filestore_omap_header_cache_size)
     {}
 
   int set_keys(
@@ -324,7 +325,8 @@ public:
   /// String munging (public for testing)
   static string ghobject_key(const ghobject_t &oid);
   static string ghobject_key_v0(coll_t c, const ghobject_t &oid);
-  static int is_buggy_ghobject_key_v1(const string &in);
+  static int is_buggy_ghobject_key_v1(CephContext* cct,
+				      const string &in);
 private:
   /// Implicit lock on Header->seq
   typedef ceph::shared_ptr<_Header> Header;
@@ -349,9 +351,9 @@ private:
     int upper_bound(const string &after) { return 0; }
     int lower_bound(const string &to) { return 0; }
     bool valid() { return false; }
-    int next(bool validate=true) { assert(0); return 0; }
-    string key() { assert(0); return ""; }
-    bufferlist value() { assert(0); return bufferlist(); }
+    int next(bool validate=true) { ceph_abort(); return 0; }
+    string key() { ceph_abort(); return ""; }
+    bufferlist value() { ceph_abort(); return bufferlist(); }
     int status() { return 0; }
   };
 

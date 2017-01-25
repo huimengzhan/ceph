@@ -6,7 +6,6 @@
 #include "common/errno.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/ImageWatcher.h"
 #include "librbd/ObjectMap.h"
 
 #define dout_subsys ceph_subsys_rbd
@@ -136,7 +135,11 @@ void SnapshotRemoveRequest<I>::send_remove_child() {
     parent_spec our_pspec;
     int r = image_ctx.get_parent_spec(m_snap_id, &our_pspec);
     if (r < 0) {
-      lderr(cct) << "failed to retrieve parent spec" << dendl;
+      if (r == -ENOENT) {
+        ldout(cct, 1) << "No such snapshot" << dendl;
+      } else {
+        lderr(cct) << "failed to retrieve parent spec" << dendl;
+      }
       m_state = STATE_ERROR;
 
       this->async_complete(r);
@@ -177,10 +180,6 @@ void SnapshotRemoveRequest<I>::send_remove_snap() {
   if (image_ctx.old_format) {
     cls_client::old_snapshot_remove(&op, m_snap_name);
   } else {
-    if (image_ctx.exclusive_lock != nullptr &&
-        image_ctx.exclusive_lock->is_lock_owner()) {
-      image_ctx.exclusive_lock->assert_header_locked(&op);
-    }
     cls_client::snapshot_remove(&op, m_snap_id);
   }
 
@@ -202,9 +201,10 @@ void SnapshotRemoveRequest<I>::send_release_snap_id() {
                 << "snap_id=" << m_snap_id << dendl;
   m_state = STATE_RELEASE_SNAP_ID;
 
-  // TODO add async version of selfmanaged_snap_remove
-  int r = image_ctx.md_ctx.selfmanaged_snap_remove(m_snap_id);
-  this->async_complete(r);
+  librados::AioCompletion *rados_completion =
+    this->create_callback_completion();
+  image_ctx.md_ctx.aio_selfmanaged_snap_remove(m_snap_id, rados_completion);
+  rados_completion->release();
 }
 
 template <typename I>

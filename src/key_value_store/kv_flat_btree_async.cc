@@ -61,7 +61,7 @@ void IndexCache::push(const string &key, const index_data &idata) {
     utime_t old_time = new_it->second.second;
     t2kmap.erase(old_time);
   }
-  utime_t time = ceph_clock_now(g_ceph_context);
+  utime_t time = ceph_clock_now();
   k2itmap[idata.kdata] = make_pair(idata, time);
   t2kmap[time] = idata.kdata;
   if ((int)k2itmap.size() > cache_size) {
@@ -79,7 +79,7 @@ void IndexCache::push(const index_data &idata) {
     t2kmap.erase(old_time);
     k2itmap.erase(idata.kdata);
   }
-  utime_t time = ceph_clock_now(g_ceph_context);
+  utime_t time = ceph_clock_now();
   k2itmap[idata.kdata] = make_pair(idata, time);
   t2kmap[time] = idata.kdata;
   if ((int)k2itmap.size() > cache_size) {
@@ -190,7 +190,7 @@ int KvFlatBtreeAsync::next(const index_data &idata, index_data * out_data)
     out_data->kdata.parse(kvs.begin()->first);
     bufferlist::iterator b = kvs.begin()->second.begin();
     out_data->decode(b);
-    if (idata.is_timed_out(ceph_clock_now(g_ceph_context),timeout)) {
+    if (idata.is_timed_out(ceph_clock_now(), timeout)) {
       if (verbose) cout << client_name << " THINKS THE OTHER CLIENT DIED."
 	  << std::endl;
       //the client died after deleting the object. clean up.
@@ -217,7 +217,7 @@ int KvFlatBtreeAsync::prev(const index_data &idata, index_data * out_data)
     if (verbose) cout << "\t\t\t" << client_name
 	<< "-prev: getting index failed with error "
 	<< err << std::endl;
-    if (idata.is_timed_out(ceph_clock_now(g_ceph_context),timeout)) {
+    if (idata.is_timed_out(ceph_clock_now(), timeout)) {
       if (verbose) cout << client_name << " THINKS THE OTHER CLIENT DIED."
 	  << std::endl;
       //the client died after deleting the object. clean up.
@@ -276,7 +276,7 @@ int KvFlatBtreeAsync::read_index(const string &key, index_data * idata,
       (cache_size / cache_refresh >= 2? cache_size / cache_refresh: 2),
       &kvmap,&err);
   err = io_ctx.operate(index_name, &oro, NULL);
-  utime_t mytime = ceph_clock_now(g_ceph_context);
+  utime_t mytime = ceph_clock_now();
   if (err < 0){
     cerr << "\t" << client_name
 	<< "-read_index: getting keys failed with "
@@ -711,7 +711,7 @@ void KvFlatBtreeAsync::set_up_prefix_index(
   std::map<std::string, pair<bufferlist, int> > assertions;
   map<string, bufferlist> to_insert;
   idata->prefix = "1";
-  idata->ts = ceph_clock_now(g_ceph_context);
+  idata->ts = ceph_clock_now();
   for(vector<object_data>::const_iterator it = to_create.begin();
       it != to_create.end();
       ++it) {
@@ -1120,7 +1120,7 @@ int KvFlatBtreeAsync::cleanup(const index_data &idata, const int &error) {
     //all changes were created except for updating the index and possibly
     //deleting the objects. roll forward.
     vector<pair<pair<int, string>, librados::ObjectWriteOperation*> > ops;
-    librados::ObjectWriteOperation owos[idata.to_delete.size() + 1];
+    vector<librados::ObjectWriteOperation> owos(idata.to_delete.size() + 1);
     for (int i = 0; i <= (int)idata.to_delete.size(); ++i) {
       ops.push_back(make_pair(pair<int, string>(0, ""), &owos[i]));
     }
@@ -1682,7 +1682,7 @@ int KvFlatBtreeAsync::get(const string &key, bufferlist *val) {
     return -ESUICIDE;
   }
   err = read_index(key, &idata, NULL, false);
-  mytime = ceph_clock_now(g_ceph_context);
+  mytime = ceph_clock_now();
   if (err < 0) {
     if (verbose) cout << "getting oid failed with code " << err << std::endl;
     return err;
@@ -1883,7 +1883,7 @@ int KvFlatBtreeAsync::set_many(const map<string, bufferlist> &in_map) {
 	                         .omap.rbegin()->first);
 
       to_create.push_back(object_data(
-    	to_string(client_name, client_index++)));
+	to_string(client_name, client_index++)));
       to_create[to_create.size() - 1].min_kdata =
 	  to_create[to_create.size() - 2].max_kdata;
     }
@@ -1893,8 +1893,8 @@ int KvFlatBtreeAsync::set_many(const map<string, bufferlist> &in_map) {
   to_create[to_create.size() - 1].max_kdata =
       to_delete[to_delete.size() - 1].max_kdata;
 
-  librados::ObjectWriteOperation owos[2 + 2 * to_delete.size()
-                                      + to_create.size()];
+  vector<librados::ObjectWriteOperation> owos(2 + 2 * to_delete.size()
+					      + to_create.size());
   vector<pair<pair<int, string>, librados::ObjectWriteOperation*> > ops;
 
 
@@ -2081,7 +2081,7 @@ bool KvFlatBtreeAsync::is_consistent() {
 	  io_ctx.aio_operate(dit->obj, aioc, &oro, NULL);
 	  aioc->wait_for_safe();
 	  err = aioc->get_return_value();
-	  if (ceph_clock_now(g_ceph_context) - idata.ts > timeout) {
+	  if (ceph_clock_now() - idata.ts > timeout) {
 	    if (err < 0) {
 	      aioc->release();
 	      if (err == -ENOENT) {

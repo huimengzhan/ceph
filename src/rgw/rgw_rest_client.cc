@@ -12,6 +12,7 @@
 #include "common/strtol.h"
 #include "include/str_list.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 int RGWRESTSimpleRequest::get_status()
@@ -95,9 +96,9 @@ int RGWRESTSimpleRequest::receive_header(void *ptr, size_t len)
   return 0;
 }
 
-static void get_new_date_str(CephContext *cct, string& date_str)
+static void get_new_date_str(string& date_str)
 {
-  utime_t tm = ceph_clock_now(cct);
+  utime_t tm = ceph_clock_now();
   stringstream s;
   tm.asctime(s);
   date_str = s.str();
@@ -117,7 +118,7 @@ int RGWRESTSimpleRequest::execute(RGWAccessKey& key, const char *method, const c
   new_url.append(new_resource);
 
   string date_str;
-  get_new_date_str(cct, date_str);
+  get_new_date_str(date_str);
   headers.push_back(pair<string, string>("HTTP_DATE", date_str));
 
   string canonical_header;
@@ -208,6 +209,11 @@ void RGWRESTSimpleRequest::get_params_str(map<string, string>& extra_args, strin
 
 int RGWRESTSimpleRequest::sign_request(RGWAccessKey& key, RGWEnv& env, req_info& info)
 {
+  /* don't sign if no key is provided */
+  if (key.key.empty()) {
+    return 0;
+  }
+
   map<string, string, ltstr_nocase>& m = env.get_map();
 
   if (cct->_conf->subsys.should_gather(ceph_subsys_rgw, 20)) {
@@ -243,7 +249,7 @@ int RGWRESTSimpleRequest::forward_request(RGWAccessKey& key, req_info& info, siz
 {
 
   string date_str;
-  get_new_date_str(cct, date_str);
+  get_new_date_str(date_str);
 
   RGWEnv new_env;
   req_info new_info(cct, &new_env);
@@ -428,7 +434,7 @@ int RGWRESTStreamWriteRequest::put_obj_init(RGWAccessKey& key, rgw_obj& obj, uin
     new_url.append("/");
 
   string date_str;
-  get_new_date_str(cct, date_str);
+  get_new_date_str(date_str);
 
   RGWEnv new_env;
   req_info new_info(cct, &new_env);
@@ -612,7 +618,7 @@ int RGWRESTStreamWriteRequest::complete(string& etag, real_time *mtime)
 int RGWRESTStreamRWRequest::get_obj(RGWAccessKey& key, map<string, string>& extra_headers, rgw_obj& obj)
 {
   string urlsafe_bucket, urlsafe_object;
-  url_encode(obj.bucket.name, urlsafe_bucket);
+  url_encode(obj.bucket.get_key(':', 0), urlsafe_bucket);
   url_encode(obj.get_orig_obj(), urlsafe_object);
   string resource = urlsafe_bucket + "/" + urlsafe_object;
 
@@ -626,7 +632,7 @@ int RGWRESTStreamRWRequest::get_resource(RGWAccessKey& key, map<string, string>&
     new_url.append("/");
 
   string date_str;
-  get_new_date_str(cct, date_str);
+  get_new_date_str(date_str);
 
   RGWEnv new_env;
   req_info new_info(cct, &new_env);
@@ -694,19 +700,31 @@ int RGWRESTStreamRWRequest::get_resource(RGWAccessKey& key, map<string, string>&
   return 0;
 }
 
-int RGWRESTStreamRWRequest::complete(string& etag, real_time *mtime, map<string, string>& attrs)
+int RGWRESTStreamRWRequest::complete(string& etag, real_time *mtime, uint64_t *psize, map<string, string>& attrs)
 {
   set_str_from_headers(out_headers, "ETAG", etag);
-  if (status >= 0 && mtime) {
-    string mtime_str;
-    set_str_from_headers(out_headers, "RGWX_MTIME", mtime_str);
-    if (!mtime_str.empty()) {
-      int ret = parse_rgwx_mtime(cct, mtime_str, mtime);
-      if (ret < 0) {
-        return ret;
+  if (status >= 0) {
+    if (mtime) {
+      string mtime_str;
+      set_str_from_headers(out_headers, "RGWX_MTIME", mtime_str);
+      if (!mtime_str.empty()) {
+        int ret = parse_rgwx_mtime(cct, mtime_str, mtime);
+        if (ret < 0) {
+          return ret;
+        }
+      } else {
+        *mtime = real_time();
       }
-    } else {
-      *mtime = real_time();
+    }
+    if (psize) {
+      string size_str;
+      set_str_from_headers(out_headers, "RGWX_OBJECT_SIZE", size_str);
+      string err;
+      *psize = strict_strtoll(size_str.c_str(), 10, &err);
+      if (!err.empty()) {
+        ldout(cct, 0) << "ERROR: failed parsing embedded metadata object size (" << size_str << ") to int " << dendl;
+        return -EIO;
+      }
     }
   }
 

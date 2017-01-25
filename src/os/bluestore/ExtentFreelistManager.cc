@@ -3,13 +3,20 @@
 
 #include "ExtentFreelistManager.h"
 #include "kv/KeyValueDB.h"
-#include "kv.h"
+#include "os/kv.h"
 
 #include "common/debug.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
 #undef dout_prefix
 #define dout_prefix *_dout << "freelist "
+
+int ExtentFreelistManager::create(uint64_t size, KeyValueDB::Transaction txn)
+{
+  release(0, size, txn);
+  return 0;
+}
 
 int ExtentFreelistManager::init()
 {
@@ -201,7 +208,7 @@ void ExtentFreelistManager::allocate(
       p->second = newlen;
     }
   }
-  if (g_conf->bluestore_debug_freelist)
+  if (cct->_conf->bluestore_debug_freelist)
     _audit();
 }
 
@@ -272,6 +279,6 @@ void ExtentFreelistManager::release(
 
   kv_free[offset] = length;
 
-  if (g_conf->bluestore_debug_freelist)
+  if (cct->_conf->bluestore_debug_freelist)
     _audit();
 }

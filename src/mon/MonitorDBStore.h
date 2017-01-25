@@ -30,6 +30,8 @@
 #include "common/debug.h"
 #include "common/safe_io.h"
 
+#define dout_context g_ceph_context
+
 class MonitorDBStore
 {
   string path;
@@ -184,7 +186,7 @@ class MonitorDBStore
     }
 
     void append_from_encoded(bufferlist& bl) {
-      TransactionRef other(new Transaction);
+      auto other(std::make_shared<Transaction>());
       bufferlist::iterator it = bl.begin();
       other->decode(it);
       append(other);
@@ -290,7 +292,7 @@ class MonitorDBStore
 	break;
       default:
 	derr << __func__ << " unknown op type " << op.type << dendl;
-	ceph_assert(0);
+	ceph_abort();
 	break;
       }
     }
@@ -374,7 +376,7 @@ class MonitorDBStore
 			 string &key,
 			 bufferlist &value,
 			 uint64_t max) {
-      TransactionRef tmp(new Transaction);
+      auto tmp(std::make_shared<Transaction>());
       bufferlist tmp_bl;
       tmp->put(prefix, key, value);
       tmp->encode(tmp_bl);
@@ -482,7 +484,7 @@ class MonitorDBStore
   Synchronizer get_synchronizer(pair<string,string> &key,
 				set<string> &prefixes) {
     KeyValueDB::WholeSpaceIterator iter;
-    iter = db->get_snapshot_iterator();
+    iter = db->get_iterator();
 
     if (!key.first.empty() && !key.second.empty())
       iter->upper_bound(key.first, key.second);
@@ -496,14 +498,14 @@ class MonitorDBStore
 
   KeyValueDB::Iterator get_iterator(const string &prefix) {
     assert(!prefix.empty());
-    KeyValueDB::Iterator iter = db->get_snapshot_iterator(prefix);
+    KeyValueDB::Iterator iter = db->get_iterator(prefix);
     iter->seek_to_first();
     return iter;
   }
 
   KeyValueDB::WholeSpaceIterator get_iterator() {
     KeyValueDB::WholeSpaceIterator iter;
-    iter = db->get_snapshot_iterator();
+    iter = db->get_iterator();
     iter->seek_to_first();
     return iter;
   }
@@ -597,7 +599,7 @@ class MonitorDBStore
       derr << __func__ << " error initializing "
 	   << kv_type << " db back storage in "
 	   << full_path << dendl;
-      assert(0 != "MonitorDBStore: error initializing keyvaluedb back storage");
+      assert(0 == "MonitorDBStore: error initializing keyvaluedb back storage");
     }
     db.reset(db_ptr);
 
@@ -644,7 +646,8 @@ class MonitorDBStore
     string kv_type;
     int r = read_meta("kv_backend", &kv_type);
     if (r < 0) {
-      kv_type = g_conf->mon_keyvaluedb;
+      // assume old monitors that did not mark the type were leveldb.
+      kv_type = "leveldb";
       r = write_meta("kv_backend", kv_type);
       if (r < 0)
 	return r;
@@ -662,6 +665,7 @@ class MonitorDBStore
     // there should be no work queued!
     io_work.stop();
     is_open = false;
+    db.reset(NULL);
   }
 
   void compact() {

@@ -17,23 +17,16 @@
 // Use the newer gperftools header locations if available.
 // If not, fall back to the old (gperftools < 2.0) locations.
 
-#ifdef HAVE_GPERFTOOLS_HEAP_PROFILER_H
-  #include <gperftools/heap-profiler.h>
-#else
-  #include <google/heap-profiler.h>
-#endif
-
-#ifdef HAVE_GPERFTOOLS_MALLOC_EXTENSION_H
-  #include <gperftools/malloc_extension.h>
-#else
-  #include <google/malloc_extension.h>
-#endif
+#include <gperftools/heap-profiler.h>
+#include <gperftools/malloc_extension.h>
 
 #include "heap_profiler.h"
 #include "common/environment.h"
 #include "common/LogClient.h"
 #include "global/global_context.h"
 #include "common/debug.h"
+
+#define dout_context g_ceph_context
 
 bool ceph_using_tcmalloc()
 {

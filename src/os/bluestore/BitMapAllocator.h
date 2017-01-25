@@ -11,40 +11,37 @@
 #include "include/btree_interval_set.h"
 
 class BitMapAllocator : public Allocator {
+  CephContext* cct;
   std::mutex m_lock;
 
-  int64_t m_num_uncommitted;
-  int64_t m_num_committing;
   int64_t m_block_size;
   int64_t m_num_reserved;
 
-  btree_interval_set<uint64_t> m_uncommitted; ///< released but not yet usable
-  btree_interval_set<uint64_t> m_committing;  ///< released but not yet usable
   BitAllocator *m_bit_alloc; // Bit allocator instance
 
   void insert_free(uint64_t offset, uint64_t len);
 
+  int64_t allocate_dis(
+    uint64_t want_size, uint64_t alloc_unit, uint64_t max_alloc_size,
+    int64_t hint, mempool::bluestore_alloc::vector<AllocExtent> *extents);
+
 public:
-  BitMapAllocator();
-  BitMapAllocator(int64_t device_size, int64_t block_size);
+  BitMapAllocator(CephContext* cct, int64_t device_size, int64_t block_size);
   ~BitMapAllocator();
 
   int reserve(uint64_t need);
   void unreserve(uint64_t unused);
 
-  int allocate(
-    uint64_t want_size, uint64_t alloc_unit, int64_t hint,
-    uint64_t *offset, uint32_t *length);
+  int64_t allocate(
+    uint64_t want_size, uint64_t alloc_unit, uint64_t max_alloc_size,
+    int64_t hint, mempool::bluestore_alloc::vector<AllocExtent> *extents);
 
   int release(
     uint64_t offset, uint64_t length);
 
-  void commit_start();
-  void commit_finish();
-
   uint64_t get_free();
 
-  void dump(std::ostream& out);
+  void dump() override;
 
   void init_add_free(uint64_t offset, uint64_t length);
   void init_rm_free(uint64_t offset, uint64_t length);

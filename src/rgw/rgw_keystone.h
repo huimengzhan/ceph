@@ -123,7 +123,7 @@ public:
   const std::string& get_user_name() const {return user.name;};
   bool has_role(const string& r) const;
   bool expired() {
-    uint64_t now = ceph_clock_now(NULL).sec();
+    uint64_t now = ceph_clock_now().sec();
     return (now >= (uint64_t)get_expires());
   }
   int parse(CephContext *cct,
@@ -173,7 +173,7 @@ class RGWKeystoneTokenCache {
   RGWKeystoneTokenCache()
     : revocator(g_ceph_context, this),
       cct(g_ceph_context),
-      lock("RGWKeystoneTokenCache", true /* recursive */),
+      lock("RGWKeystoneTokenCache"),
       max(cct->_conf->rgw_keystone_token_cache_size) {
     /* The thread name has been kept for backward compliance. */
     revocator.create("rgw_swift_k_rev");
@@ -197,6 +197,10 @@ public:
   void add_admin(const KeystoneToken& token);
   void invalidate(const string& token_id);
   bool going_down() const;
+private:
+  void add_locked(const string& token_id, const KeystoneToken& token);
+  bool find_locked(const string& token_id, KeystoneToken& token);
+
 };
 
 

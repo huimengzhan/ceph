@@ -5,7 +5,7 @@
   
   Positional arguments:
     <command>
-      bench-write                 Simple write benchmark.
+      bench                       Simple benchmark.
       children                    Display children of snapshot.
       clone                       Clone a snapshot into a COW child image.
       copy (cp)                   Copy src image to dest.
@@ -21,6 +21,9 @@
       flatten                     Fill clone with parent data (make it
                                   independent).
       group create                Create a consistency group.
+      group image add             Add an image to a consistency group.
+      group image list            List images in a consistency group.
+      group image remove          Remove an image from a consistency group.
       group list (group ls)       List rbd consistency groups.
       group remove (group rm)     Delete a consistency group.
       image-meta get              Image metadata get the value associated with
@@ -33,6 +36,7 @@
       import-diff                 Import an incremental diff.
       info                        Show information about image size, striping,
                                   etc.
+      journal client disconnect   Flag image journal client as disconnected.
       journal export              Export image journal.
       journal import              Import image journal.
       journal info                Show information about image journal.
@@ -96,13 +100,13 @@
   
   See 'rbd help <command>' for help on a specific command.
   $ rbd help | grep '^    [a-z]' | sed 's/^    \([a-z -]*[a-z]\).*/\1/g' | while read -r line; do echo rbd help $line ; rbd help $line; done
-  rbd help bench-write
-  usage: rbd bench-write [--pool <pool>] [--image <image>] [--io-size <io-size>] 
-                         [--io-threads <io-threads>] [--io-total <io-total>] 
-                         [--io-pattern <io-pattern>] 
-                         <image-spec> 
+  rbd help bench
+  usage: rbd bench [--pool <pool>] [--image <image>] [--io-size <io-size>] 
+                   [--io-threads <io-threads>] [--io-total <io-total>] 
+                   [--io-pattern <io-pattern>] --io-type <io-type> 
+                   <image-spec> 
   
-  Simple write benchmark.
+  Simple benchmark.
   
   Positional arguments
     <image-spec>         image specification
@@ -111,10 +115,11 @@
   Optional arguments
     -p [ --pool ] arg    pool name
     --image arg          image name
-    --io-size arg        write size (in B/K/M/G/T)
+    --io-size arg        IO size (in B/K/M/G/T)
     --io-threads arg     ios in flight
-    --io-total arg       total size to write (in B/K/M/G/T)
-    --io-pattern arg     write pattern (rand or seq)
+    --io-total arg       total size for IO (in B/K/M/G/T)
+    --io-pattern arg     IO pattern (rand or seq)
+    --io-type arg        IO type (read or write)
   
   rbd help children
   usage: rbd children [--pool <pool>] [--image <image>] [--snap <snap>] 
@@ -140,6 +145,7 @@
                    [--object-size <object-size>] 
                    [--image-feature <image-feature>] [--image-shared] 
                    [--stripe-unit <stripe-unit>] [--stripe-count <stripe-count>] 
+                   [--data-pool <data-pool>] 
                    [--journal-splay-width <journal-splay-width>] 
                    [--journal-object-size <journal-object-size>] 
                    [--journal-pool <journal-pool>] 
@@ -165,10 +171,11 @@
     --image-feature arg       image features
                               [layering(+), striping, exclusive-lock(+*),
                               object-map(+*), fast-diff(+*), deep-flatten(+-),
-                              journaling(*)]
+                              journaling(*), data-pool]
     --image-shared            shared image
-    --stripe-unit arg         stripe unit
+    --stripe-unit arg         stripe unit in B/K/M
     --stripe-count arg        stripe count
+    --data-pool arg           data pool
     --journal-splay-width arg number of active journal objects
     --journal-object-size arg size of journal objects
     --journal-pool arg        pool for journal objects
@@ -184,6 +191,7 @@
                   [--object-size <object-size>] 
                   [--image-feature <image-feature>] [--image-shared] 
                   [--stripe-unit <stripe-unit>] [--stripe-count <stripe-count>] 
+                  [--data-pool <data-pool>] 
                   [--journal-splay-width <journal-splay-width>] 
                   [--journal-object-size <journal-object-size>] 
                   [--journal-pool <journal-pool>] [--no-progress] 
@@ -209,10 +217,11 @@
     --image-feature arg          image features
                                  [layering(+), striping, exclusive-lock(+*),
                                  object-map(+*), fast-diff(+*), deep-flatten(+-),
-                                 journaling(*)]
+                                 journaling(*), data-pool]
     --image-shared               shared image
-    --stripe-unit arg            stripe unit
+    --stripe-unit arg            stripe unit in B/K/M
     --stripe-count arg           stripe count
+    --data-pool arg              data pool
     --journal-splay-width arg    number of active journal objects
     --journal-object-size arg    size of journal objects
     --journal-pool arg           pool for journal objects
@@ -229,7 +238,7 @@
                     [--order <order>] [--object-size <object-size>] 
                     [--image-feature <image-feature>] [--image-shared] 
                     [--stripe-unit <stripe-unit>] 
-                    [--stripe-count <stripe-count>] 
+                    [--stripe-count <stripe-count>] [--data-pool <data-pool>] 
                     [--journal-splay-width <journal-splay-width>] 
                     [--journal-object-size <journal-object-size>] 
                     [--journal-pool <journal-pool>] --size <size> 
@@ -252,10 +261,11 @@
     --image-feature arg       image features
                               [layering(+), striping, exclusive-lock(+*),
                               object-map(+*), fast-diff(+*), deep-flatten(+-),
-                              journaling(*)]
+                              journaling(*), data-pool]
     --image-shared            shared image
-    --stripe-unit arg         stripe unit
+    --stripe-unit arg         stripe unit in B/K/M
     --stripe-count arg        stripe count
+    --data-pool arg           data pool
     --journal-splay-width arg number of active journal objects
     --journal-object-size arg size of journal objects
     --journal-pool arg        pool for journal objects
@@ -361,7 +371,7 @@
                          (example: [<pool-name>/]<image-name>)
     <features>           image features
                          [layering, striping, exclusive-lock, object-map,
-                         fast-diff, deep-flatten, journaling]
+                         fast-diff, deep-flatten, journaling, data-pool]
   
   Optional arguments
     -p [ --pool ] arg    pool name
@@ -381,7 +391,7 @@
                               (example: [<pool-name>/]<image-name>)
     <features>                image features
                               [layering, striping, exclusive-lock, object-map,
-                              fast-diff, deep-flatten, journaling]
+                              fast-diff, deep-flatten, journaling, data-pool]
   
   Optional arguments
     -p [ --pool ] arg         pool name
@@ -418,6 +428,65 @@
   Optional arguments
     -p [ --pool ] arg    pool name
     --group arg          group name
+  
+  rbd help group image add
+  usage: rbd group image add [--group-pool <group-pool>] [--group <group>] 
+                             [--image-pool <image-pool>] [--image <image>] 
+                             [--pool <pool>] 
+                             <group-spec> <image-spec> 
+  
+  Add an image to a consistency group.
+  
+  Positional arguments
+    <group-spec>         group specification
+                         (example: [<pool-name>/]<group-name>)
+    <image-spec>         image specification
+                         (example: [<pool-name>/]<image-name>)
+  
+  Optional arguments
+    --group-pool arg     group pool name
+    --group arg          group name
+    --image-pool arg     image pool name
+    --image arg          image name
+    -p [ --pool ] arg    pool name unless overridden
+  
+  rbd help group image list
+  usage: rbd group image list [--format <format>] [--pretty-format] 
+                              [--pool <pool>] [--group <group>] 
+                              <group-spec> 
+  
+  List images in a consistency group.
+  
+  Positional arguments
+    <group-spec>         group specification
+                         (example: [<pool-name>/]<group-name>)
+  
+  Optional arguments
+    --format arg         output format [plain, json, or xml]
+    --pretty-format      pretty formatting (json and xml)
+    -p [ --pool ] arg    pool name
+    --group arg          group name
+  
+  rbd help group image remove
+  usage: rbd group image remove [--group-pool <group-pool>] [--group <group>] 
+                                [--image-pool <image-pool>] [--image <image>] 
+                                [--pool <pool>] 
+                                <group-spec> <image-spec> 
+  
+  Remove an image from a consistency group.
+  
+  Positional arguments
+    <group-spec>         group specification
+                         (example: [<pool-name>/]<group-name>)
+    <image-spec>         image specification
+                         (example: [<pool-name>/]<image-name>)
+  
+  Optional arguments
+    --group-pool arg     group pool name
+    --group arg          group name
+    --image-pool arg     image pool name
+    --image arg          image name
+    -p [ --pool ] arg    pool name unless overridden
   
   rbd help group list
   usage: rbd group list [--pool <pool>] [--format <format>] [--pretty-format] 
@@ -512,7 +581,7 @@
                     [--order <order>] [--object-size <object-size>] 
                     [--image-feature <image-feature>] [--image-shared] 
                     [--stripe-unit <stripe-unit>] 
-                    [--stripe-count <stripe-count>] 
+                    [--stripe-count <stripe-count>] [--data-pool <data-pool>] 
                     [--journal-splay-width <journal-splay-width>] 
                     [--journal-object-size <journal-object-size>] 
                     [--journal-pool <journal-pool>] [--no-progress] 
@@ -538,10 +607,11 @@
     --image-feature arg       image features
                               [layering(+), striping, exclusive-lock(+*),
                               object-map(+*), fast-diff(+*), deep-flatten(+-),
-                              journaling(*)]
+                              journaling(*), data-pool]
     --image-shared            shared image
-    --stripe-unit arg         stripe unit
+    --stripe-unit arg         stripe unit in B/K/M
     --stripe-count arg        stripe count
+    --data-pool arg           data pool
     --journal-splay-width arg number of active journal objects
     --journal-object-size arg size of journal objects
     --journal-pool arg        pool for journal objects
@@ -589,6 +659,24 @@
     --snap arg            snapshot name
     --format arg          output format [plain, json, or xml]
     --pretty-format       pretty formatting (json and xml)
+  
+  rbd help journal client disconnect
+  usage: rbd journal client disconnect [--pool <pool>] [--image <image>] 
+                                       [--journal <journal>] 
+                                       [--client-id <client-id>] 
+                                       <journal-spec> 
+  
+  Flag image journal client as disconnected.
+  
+  Positional arguments
+    <journal-spec>       journal specification
+                         (example: [<pool-name>/]<journal-name>)
+  
+  Optional arguments
+    -p [ --pool ] arg    pool name
+    --image arg          image name
+    --journal arg        journal name
+    --client-id arg      client ID (or leave unspecified to disconnect all)
   
   rbd help journal export
   usage: rbd journal export [--pool <pool>] [--image <image>] 
@@ -782,8 +870,8 @@
     -p [ --pool ] arg     pool name
     --image arg           image name
     --snap arg            snapshot name
-    -o [ --options ] arg  mapping options
-    --read-only           mount read-only
+    -o [ --options ] arg  map options
+    --read-only           map read-only
   
   rbd help merge-diff
   usage: rbd merge-diff [--path <path>] [--no-progress] 
@@ -998,7 +1086,8 @@
   
   rbd help nbd map
   usage: rbd nbd map [--pool <pool>] [--image <image>] [--snap <snap>] 
-                     [--read-only] [--device <device>] 
+                     [--read-only] [--exclusive] [--device <device>] 
+                     [--nbds_max <nbds_max>] [--max_part <max_part>] 
                      <image-or-snap-spec> 
   
   Map image to a nbd device.
@@ -1012,7 +1101,10 @@
     --image arg           image name
     --snap arg            snapshot name
     --read-only           mount read-only
+    --exclusive           forbid other clients write
     --device arg          specify nbd device
+    --nbds_max arg        override module param nbds_max
+    --max_part arg        override module param max_part
   
   rbd help nbd unmap
   usage: rbd nbd unmap 
@@ -1211,6 +1303,7 @@
   
   rbd help snap remove
   usage: rbd snap remove [--pool <pool>] [--image <image>] [--snap <snap>] 
+                         [--no-progress] [--force] 
                          <snap-spec> 
   
   Deletes a snapshot.
@@ -1223,6 +1316,8 @@
     -p [ --pool ] arg    pool name
     --image arg          image name
     --snap arg           snapshot name
+    --no-progress        disable progress output
+    --force              flatten children and unprotect snapshot if needed.
   
   rbd help snap rename
   usage: rbd snap rename [--pool <pool>] [--image <image>] [--snap <snap>] 
@@ -1297,6 +1392,7 @@
   
   rbd help unmap
   usage: rbd unmap [--pool <pool>] [--image <image>] [--snap <snap>] 
+                   [--options <options>] 
                    <image-or-snap-or-device-spec> 
   
   Unmap a rbd device that was used by the kernel.
@@ -1310,6 +1406,7 @@
     -p [ --pool ] arg               pool name
     --image arg                     image name
     --snap arg                      snapshot name
+    -o [ --options ] arg            unmap options
   
   rbd help watch
   usage: rbd watch [--pool <pool>] [--image <image>] 

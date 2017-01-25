@@ -1391,6 +1391,7 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
 {
   std::string subprocess_msg;
   int ret;
+  int32_t key_type = op_state.get_key_type();
 
   ret = check_op(op_state, &subprocess_msg);
   if (ret < 0) {
@@ -1398,6 +1399,10 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
     return ret;
   }
 
+  if (key_type == KEY_TYPE_S3 && op_state.get_access_key().empty()) {
+    op_state.set_gen_access();
+  }
+  
   if (op_state.get_secret_key().empty()) {
     op_state.set_gen_secret();
   }
@@ -1835,9 +1840,7 @@ int RGWUser::check_op(RGWUserAdminOpState& op_state, std::string *err_msg)
 {
   bool same_id;
   bool populated;
-  //bool existing_email = false; // this check causes a fault
   rgw_user& op_id = op_state.get_user_id();
-  std::string op_email = op_state.get_user_email();
 
   RGWUserInfo user_info;
 
@@ -1917,6 +1920,7 @@ int RGWUser::execute_add(RGWUserAdminOpState& op_state, std::string *err_msg)
   user_id = uid;
   user_info.user_id = user_id;
   user_info.display_name = display_name;
+  user_info.type = TYPE_RGW;
 
   if (!user_email.empty())
     user_info.user_email = user_email;
@@ -1935,8 +1939,18 @@ int RGWUser::execute_add(RGWUserAdminOpState& op_state, std::string *err_msg)
   if (op_state.op_mask_specified)
     user_info.op_mask = op_state.get_op_mask();
 
-  if (op_state.has_bucket_quota())
+  if (op_state.has_bucket_quota()) {
     user_info.bucket_quota = op_state.get_bucket_quota();
+  } else {
+    if (cct->_conf->rgw_bucket_default_quota_max_objects >= 0) {
+      user_info.bucket_quota.max_objects = cct->_conf->rgw_bucket_default_quota_max_objects;
+      user_info.bucket_quota.enabled = true;
+    }
+    if (cct->_conf->rgw_bucket_default_quota_max_size >= 0) {
+      user_info.bucket_quota.max_size = cct->_conf->rgw_bucket_default_quota_max_size;
+      user_info.bucket_quota.enabled = true;
+    }
+  }
 
   if (op_state.temp_url_key_specified) {
     map<int, string>::iterator iter;
@@ -1946,8 +1960,18 @@ int RGWUser::execute_add(RGWUserAdminOpState& op_state, std::string *err_msg)
     }
   }
 
-  if (op_state.has_user_quota())
+  if (op_state.has_user_quota()) {
     user_info.user_quota = op_state.get_user_quota();
+  } else {
+    if (cct->_conf->rgw_user_default_quota_max_objects >= 0) {
+      user_info.user_quota.max_objects = cct->_conf->rgw_user_default_quota_max_objects;
+      user_info.user_quota.enabled = true;
+    }
+    if (cct->_conf->rgw_user_default_quota_max_size >= 0) {
+      user_info.user_quota.max_size = cct->_conf->rgw_user_default_quota_max_size;
+      user_info.user_quota.enabled = true;
+    }
+  }
 
   // update the request
   op_state.set_user_info(user_info);
@@ -2129,8 +2153,16 @@ int RGWUser::execute_modify(RGWUserAdminOpState& op_state, std::string *err_msg)
       }
     }
     user_info.user_email = op_email;
-  }
+  } else if (op_email.empty() && op_state.user_email_specified) {
 
+    ldout(store->ctx(), 10) << "removing email index: " << user_info.user_email << dendl;
+    ret = rgw_remove_email_index(store, user_info.user_email);
+    if (ret < 0 && ret != -ENOENT) {
+      ldout(store->ctx(), 0) << "ERROR: could not remove " << user_info.user_id << " index (err=" << ret << ")" << dendl;
+      return ret;
+    }
+    user_info.user_email = "";
+  }
 
   // update the remaining user info
   if (!display_name.empty())

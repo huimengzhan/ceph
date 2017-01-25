@@ -14,7 +14,6 @@
 #include "common/dns_resolve.h"
 #include "test/common/dns_messages.h"
 
-#include "test/unit.h"
 #include "common/debug.h"
 #include "gmock/gmock.h"
 
@@ -84,7 +83,7 @@ TEST_F(DNSResolverTest, resolve_ip_addr_fail) {
   ASSERT_EQ(ret, -1);
   std::ostringstream os;
   os << addr;
-  ASSERT_EQ(os.str(), ":/0");
+  ASSERT_EQ(os.str(), "-");
 }
 
 

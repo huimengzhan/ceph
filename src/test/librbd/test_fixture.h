@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 #include "include/int_types.h"
 #include "include/rados/librados.h"
@@ -40,6 +40,7 @@ public:
   static std::string _pool_name;
   static librados::Rados _rados;
   static uint64_t _image_number;
+  static std::string _data_pool;
 
   librados::IoCtx m_ioctx;
   librbd::RBD m_rbd;

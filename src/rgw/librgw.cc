@@ -13,6 +13,7 @@
  */
 #include <sys/types.h>
 #include <string.h>
+#include <chrono>
 
 #include "include/types.h"
 #include "include/rados/librgw.h"
@@ -80,10 +81,28 @@ namespace rgw {
     m_tp.drain(&req_wq);
   }
 
+#define MIN_EXPIRE_S 120
+
   void RGWLibProcess::run()
   {
+    /* write completion interval */
+    RGWLibFS::write_completion_interval_s =
+      cct->_conf->rgw_nfs_write_completion_interval_s;
+
+    /* start write timer */
+    RGWLibFS::write_timer.resume();
+
+    /* gc loop */
     while (! shutdown) {
       lsubdout(cct, rgw, 5) << "RGWLibProcess GC" << dendl;
+
+      /* dirent invalidate timeout--basically, the upper-bound on
+       * inconsistency with the S3 namespace */
+      auto expire_s = cct->_conf->rgw_nfs_namespace_expire_secs;
+
+      /* delay between gc cycles */
+      auto delay_s = std::max(1, std::min(MIN_EXPIRE_S, expire_s/2));
+
       unique_lock uniq(mtx);
     restart:
       int cur_gen = gen;
@@ -98,7 +117,7 @@ namespace rgw {
 	  goto restart; /* invalidated */
       }
       uniq.unlock();
-      std::this_thread::sleep_for(std::chrono::seconds(120));
+      std::this_thread::sleep_for(std::chrono::seconds(delay_s));
     }
   }
 
@@ -112,7 +131,7 @@ namespace rgw {
     // XXX move RGWLibIO and timing setup into process_request
 
 #if 0 /* XXX */
-    utime_t tm = ceph_clock_now(NULL);
+    utime_t tm = ceph_clock_now();
 #endif
 
     RGWLibIO io_ctx;
@@ -131,7 +150,7 @@ namespace rgw {
     // XXX move RGWLibIO and timing setup into process_request
 
 #if 0 /* XXX */
-    utime_t tm = ceph_clock_now(NULL);
+    utime_t tm = ceph_clock_now();
 #endif
 
     RGWLibIO io_ctx;
@@ -282,12 +301,15 @@ namespace rgw {
     op->complete();
 
   done:
-    int r = io->complete_request();
-    if (r < 0) {
-      dout(0) << "ERROR: io->complete_request() returned " << r << dendl;
+    try {
+      io->complete_request();
+    } catch (rgw::io::Exception& e) {
+      dout(0) << "ERROR: io->complete_request() returned "
+              << e.what() << dendl;
     }
     if (should_log) {
-      rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+      rgw_log_op(store, nullptr /* !rest */, s,
+		 (op ? op->name() : "unknown"), olog);
     }
 
     int http_ret = s->err.http_ret;
@@ -437,10 +459,10 @@ namespace rgw {
     def_args.push_back("--keyring=$rgw_data/keyring");
     def_args.push_back("--log-file=/var/log/radosgw/$cluster-$name.log");
 
-    global_init(&def_args, args,
-		CEPH_ENTITY_TYPE_CLIENT,
-		CODE_ENVIRONMENT_DAEMON,
-		CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
+    cct = global_init(&def_args, args,
+		      CEPH_ENTITY_TYPE_CLIENT,
+		      CODE_ENVIRONMENT_DAEMON,
+		      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
     Mutex mutex("main");
     SafeTimer init_timer(g_ceph_context, mutex);
@@ -457,6 +479,7 @@ namespace rgw {
 
     store = RGWStoreManager::get_storage(g_ceph_context,
 					 g_conf->rgw_enable_gc_threads,
+					 g_conf->rgw_enable_lc_threads,
 					 g_conf->rgw_enable_quota_threads,
 					 g_conf->rgw_run_sync_thread);
 
@@ -485,12 +508,13 @@ namespace rgw {
     const string& ldap_uri = store->ctx()->_conf->rgw_ldap_uri;
     const string& ldap_binddn = store->ctx()->_conf->rgw_ldap_binddn;
     const string& ldap_searchdn = store->ctx()->_conf->rgw_ldap_searchdn;
+    const string& ldap_searchfilter = store->ctx()->_conf->rgw_ldap_searchfilter;
     const string& ldap_dnattr =
       store->ctx()->_conf->rgw_ldap_dnattr;
     std::string ldap_bindpw = parse_rgw_ldap_bindpw(store->ctx());
 
     ldh = new rgw::LDAPHelper(ldap_uri, ldap_binddn, ldap_bindpw.c_str(),
-			      ldap_searchdn, ldap_dnattr);
+			      ldap_searchdn, ldap_searchfilter, ldap_dnattr);
     ldh->init();
     ldh->bind();
 
@@ -546,9 +570,7 @@ namespace rgw {
     rgw_perf_stop(g_ceph_context);
 
     dout(1) << "final shutdown" << dendl;
-    g_ceph_context->put();
-
-    ceph::crypto::shutdown();
+    cct.reset();
 
     return 0;
   } /* RGWLib::stop() */

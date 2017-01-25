@@ -11,12 +11,7 @@
 IMAGE_COUNT=50
 export LOCKDEP=0
 
-if [ -n "${CEPH_REF}" ]; then
-  wget -O rbd_mirror_helpers.sh "https://git.ceph.com/?p=ceph.git;a=blob_plain;hb=$CEPH_REF;f=qa/workunits/rbd/rbd_mirror_helpers.sh"
-  . ./rbd_mirror_helpers.sh
-else
-  . $(dirname $0)/rbd_mirror_helpers.sh
-fi
+. $(dirname $0)/rbd_mirror_helpers.sh
 
 create_snap()
 {
@@ -42,6 +37,7 @@ compare_image_snaps()
     rbd --cluster ${CLUSTER2} -p ${pool} export ${image}@${snap_name} ${rmt_export}
     rbd --cluster ${CLUSTER1} -p ${pool} export ${image}@${snap_name} ${loc_export}
     cmp ${rmt_export} ${loc_export}
+    rm -f ${rmt_export} ${loc_export}
 }
 
 wait_for_pool_images()
@@ -55,17 +51,18 @@ wait_for_pool_images()
 
     while true; do
         for s in `seq 1 40`; do
+            test $s -ne 1 && sleep 30
             count=$(rbd --cluster ${cluster} -p ${pool} mirror pool status | grep 'images: ' | cut -d' ' -f 2)
             test "${count}" = "${image_count}" && return 0
 
             # reset timeout if making forward progress
-            test $count -gt $last_count && break
-            sleep 30
+            test $count -ne $last_count && break
         done
 
-        test $count -eq $last_count && return 1
-        $last_count=$count
+        test $count -eq $last_count && break
+        last_count=$count
     done
+    rbd --cluster ${cluster} -p ${pool} mirror pool status --verbose >&2
     return 1
 }
 
@@ -77,11 +74,12 @@ wait_for_pool_healthy()
     local state
 
     for s in `seq 1 40`; do
+        test $s -ne 1 && sleep 30
         state=$(rbd --cluster ${cluster} -p ${pool} mirror pool status | grep 'health:' | cut -d' ' -f 2)
-        test "${state}" = "ERROR" && return 1
+        test "${state}" = "ERROR" && break
         test "${state}" = "OK" && return 0
-	sleep 30
     done
+    rbd --cluster ${cluster} -p ${pool} mirror pool status --verbose >&2
     return 1
 }
 
@@ -97,10 +95,12 @@ for i in `seq 1 10`
 do
   stress_write_image ${CLUSTER2} ${POOL} ${image}
 
-  test_status_in_pool_dir ${CLUSTER1} ${POOL} ${image} 'up+replaying' 'master_position'
+  wait_for_status_in_pool_dir ${CLUSTER1} ${POOL} ${image} 'up+replaying' 'master_position'
 
   snap_name="snap${i}"
   create_snap ${CLUSTER2} ${POOL} ${image} ${snap_name}
+  wait_for_image_replay_started ${CLUSTER1} ${POOL} ${image}
+  wait_for_replay_complete ${CLUSTER1} ${CLUSTER2} ${POOL} ${image}
   wait_for_snap_present ${CLUSTER1} ${POOL} ${image} ${snap_name}
   compare_image_snaps ${POOL} ${image} ${snap_name}
 done
@@ -111,7 +111,7 @@ do
   remove_snapshot ${CLUSTER2} ${POOL} ${image} ${snap_name}
 done
 
-remove_image ${CLUSTER2} ${POOL} ${image}
+remove_image_retry ${CLUSTER2} ${POOL} ${image}
 wait_for_image_present ${CLUSTER1} ${POOL} ${image} 'deleted'
 
 testlog "TEST: create many images"
@@ -149,10 +149,11 @@ for i in `seq 1 ${IMAGE_COUNT}`
 do
   image="image_${i}"
   remove_snapshot ${CLUSTER2} ${POOL} ${image} ${snap_name}
-  remove_image ${CLUSTER2} ${POOL} ${image}
+  remove_image_retry ${CLUSTER2} ${POOL} ${image}
 done
 
 testlog "TEST: image deletions should propagate"
+wait_for_pool_images ${CLUSTER1} ${POOL} 0
 wait_for_pool_healthy ${CLUSTER1} ${POOL} 0
 for i in `seq 1 ${IMAGE_COUNT}`
 do

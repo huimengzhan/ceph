@@ -21,6 +21,7 @@ class BitmapFreelistManager : public FreelistManager {
   uint64_t size;            ///< size of device (bytes)
   uint64_t bytes_per_block; ///< bytes per block (bdev_block_size)
   uint64_t blocks_per_key;  ///< blocks (bits) per key/value pair
+  uint64_t bytes_per_key;   ///< bytes per key/value pair
   uint64_t blocks;          ///< size of device (blocks, size rounded up)
 
   uint64_t block_mask;  ///< mask to convert byte offset to block offset
@@ -33,7 +34,7 @@ class BitmapFreelistManager : public FreelistManager {
   bufferlist enumerate_bl;   ///< current key at enumerate_offset
   int enumerate_bl_pos;      ///< bit position in enumerate_bl
 
-  uint64_t get_offset(uint64_t key_off, int bit) {
+  uint64_t _get_offset(uint64_t key_off, int bit) {
     return key_off + bit * bytes_per_block;
   }
 
@@ -45,7 +46,7 @@ class BitmapFreelistManager : public FreelistManager {
     KeyValueDB::Transaction txn);
 
 public:
-  BitmapFreelistManager(KeyValueDB *db, string meta_prefix,
+  BitmapFreelistManager(CephContext* cct, KeyValueDB *db, string meta_prefix,
 			string bitmap_prefix);
 
   static void setup_merge_operator(KeyValueDB *db, string prefix);
@@ -66,6 +67,10 @@ public:
   void release(
     uint64_t offset, uint64_t length,
     KeyValueDB::Transaction txn) override;
+
+  bool supports_parallel_transactions() override {
+    return true;
+  }
 };
 
 #endif

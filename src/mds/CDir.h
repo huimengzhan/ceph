@@ -19,9 +19,11 @@
 
 #include "include/types.h"
 #include "include/buffer_fwd.h"
-#include "mdstypes.h"
+#include "common/bloom_filter.hpp"
 #include "common/config.h"
 #include "common/DecayCounter.h"
+
+#include "MDSCacheObject.h"
 
 #include <iosfwd>
 
@@ -35,13 +37,13 @@
 
 class CDentry;
 class MDCache;
-class MDCluster;
-class bloom_filter;
 
 struct ObjectOperation;
 
 ostream& operator<<(ostream& out, const class CDir& dir);
 class CDir : public MDSCacheObject {
+  friend ostream& operator<<(ostream& out, const class CDir& dir);
+
   /*
    * This class uses a boost::pool to handle allocation. This is *not*
    * thread-safe, so don't do allocations from multiple threads!
@@ -97,6 +99,7 @@ public:
   static const unsigned STATE_FREEZINGDIR =   (1<< 5);
   static const unsigned STATE_COMMITTING =    (1<< 6);   // mid-commit
   static const unsigned STATE_FETCHING =      (1<< 7);   // currenting fetching
+  static const unsigned STATE_CREATING =      (1<< 8);
   static const unsigned STATE_IMPORTBOUND =   (1<<10);
   static const unsigned STATE_EXPORTBOUND =   (1<<11);
   static const unsigned STATE_EXPORTING =     (1<<12);
@@ -147,6 +150,7 @@ public:
   static const uint64_t WAIT_DENTRY       = (1<<0);  // wait for item to be in cache
   static const uint64_t WAIT_COMPLETE     = (1<<1);  // wait for complete dir contents
   static const uint64_t WAIT_FROZEN       = (1<<2);  // auth pins removed
+  static const uint64_t WAIT_CREATED	  = (1<<3);  // new dirfrag is logged
 
   static const int WAIT_DNLOCK_OFFSET = 4;
 
@@ -337,7 +341,7 @@ private:
 
 
 protected:
-  scrub_info_t *scrub_infop;
+  std::unique_ptr<scrub_info_t> scrub_infop;
 
   // contents of this directory
   map_t items;       // non-null AND null
@@ -394,15 +398,13 @@ protected:
   friend class C_IO_Dir_OMAP_Fetched;
   friend class C_IO_Dir_Committed;
 
-  bloom_filter *bloom;
+  std::unique_ptr<bloom_filter> bloom;
   /* If you set up the bloom filter, you must keep it accurate!
    * It's deleted when you mark_complete() and is deliberately not serialized.*/
 
  public:
   CDir(CInode *in, frag_t fg, MDCache *mdcache, bool auth);
   ~CDir() {
-    delete scrub_infop;
-    remove_bloom();
     g_num_dir--;
     g_num_dirs++;
   }
@@ -411,7 +413,7 @@ protected:
     if (!scrub_infop) {
       scrub_info_create();
     }
-    return scrub_infop;
+    return scrub_infop.get();
   }
 
 
@@ -426,6 +428,7 @@ protected:
 
   map_t::iterator begin() { return items.begin(); }
   map_t::iterator end() { return items.end(); }
+  map_t::iterator lower_bound(dentry_key_t key) { return items.lower_bound(key); }
 
   unsigned get_num_head_items() const { return num_head_items; }
   unsigned get_num_head_null() const { return num_head_null; }
@@ -444,7 +447,9 @@ protected:
     return num_dirty;
   }
 
-  int64_t get_frag_size() { return get_projected_fnode()->fragstat.size(); }
+  int64_t get_frag_size() const {
+    return get_projected_fnode()->fragstat.size();
+  }
 
   // -- dentries and inodes --
  public:
@@ -470,7 +475,9 @@ protected:
   void add_to_bloom(CDentry *dn);
   bool is_in_bloom(const std::string& name);
   bool has_bloom() { return (bloom ? true : false); }
-  void remove_bloom();
+  void remove_bloom() {
+    bloom.reset();
+  }
 private:
   void link_inode_work( CDentry *dn, CInode *in );
   void unlink_inode_work( CDentry *dn );
@@ -486,10 +493,11 @@ public:
   void split(int bits, list<CDir*>& subs, list<MDSInternalContextBase*>& waiters, bool replay);
   void merge(list<CDir*>& subs, list<MDSInternalContextBase*>& waiters, bool replay);
 
-  bool should_split() {
+  bool should_split() const {
     return (int)get_frag_size() > g_conf->mds_bal_split_size;
   }
-  bool should_merge() {
+  bool should_split_fast() const;
+  bool should_merge() const {
     return (int)get_frag_size() < g_conf->mds_bal_merge_size;
   }
 
@@ -509,6 +517,8 @@ private:
    *             <parent,mds2>       subtree_root     
    */
   mds_authority_t dir_auth;
+
+  std::string get_path() const;
 
  public:
   mds_authority_t authority() const;

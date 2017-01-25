@@ -28,6 +28,7 @@
 
 /// track in-flight io
 struct IOContext {
+  CephContext* cct;
   void *priv;
 #ifdef HAVE_SPDK
   void *nvme_task_first = nullptr;
@@ -44,17 +45,16 @@ struct IOContext {
   std::atomic_int num_reading = {0};
   std::atomic_int num_waiting = {0};
 
-  explicit IOContext(void *p)
-    : priv(p)
+  explicit IOContext(CephContext* cct, void *p)
+    : cct(cct), priv(p)
     {}
 
   // no copying
-  IOContext(const IOContext& other);
-  IOContext &operator=(const IOContext& other);
+  IOContext(const IOContext& other) = delete;
+  IOContext &operator=(const IOContext& other) = delete;
 
-  bool has_aios() {
-    std::lock_guard<std::mutex> l(lock);
-    return num_pending.load() || num_running.load();
+  bool has_pending_aios() {
+    return num_pending.load();
   }
 
   void aio_wait();
@@ -69,20 +69,23 @@ struct IOContext {
 
 
 class BlockDevice {
+public:
+  CephContext* cct;
+private:
   std::mutex ioc_reap_lock;
   vector<IOContext*> ioc_reap_queue;
   std::atomic_int ioc_reap_count = {0};
 
 protected:
-  bool rotational;
+  bool rotational = true;
 
 public:
-  BlockDevice() = default;
+  BlockDevice(CephContext* cct) : cct(cct) {}
   virtual ~BlockDevice() = default;
   typedef void (*aio_callback_t)(void *handle, void *aio);
 
   static BlockDevice *create(
-      const string& path, aio_callback_t cb, void *cbpriv);
+    CephContext* cct, const string& path, aio_callback_t cb, void *cbpriv);
   virtual bool supported_bdev_label() { return true; }
   virtual bool is_rotational() { return rotational; }
 
@@ -105,7 +108,7 @@ public:
 
   // for managing buffered readers/writers
   virtual int invalidate_cache(uint64_t off, uint64_t len) = 0;
-  virtual int open(string path) = 0;
+  virtual int open(const string& path) = 0;
   virtual void close() = 0;
 };
 

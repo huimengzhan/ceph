@@ -4,8 +4,6 @@
 #ifndef CEPH_LIBRBD_IMAGE_SNAP_SET_REQUEST_H
 #define CEPH_LIBRBD_IMAGE_SNAP_SET_REQUEST_H
 
-#include "include/int_types.h"
-#include "librbd/parent_types.h"
 #include <string>
 
 class Context;
@@ -14,7 +12,7 @@ namespace librbd {
 
 template <typename> class ExclusiveLock;
 class ImageCtx;
-class ObjectMap;
+template <typename> class ObjectMap;
 
 namespace image {
 
@@ -86,7 +84,7 @@ private:
 
   uint64_t m_snap_id;
   ExclusiveLock<ImageCtxT> *m_exclusive_lock;
-  ObjectMap *m_object_map;
+  ObjectMap<ImageCtxT> *m_object_map;
   RefreshParentRequest<ImageCtxT> *m_refresh_parent;
 
   bool m_writes_blocked;
